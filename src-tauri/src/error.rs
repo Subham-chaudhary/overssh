@@ -13,17 +13,29 @@ use thiserror::Error;
 #[serde(tag = "kind")]
 pub enum AppError {
     #[error("{message}")]
-    NeedPassword { message: String },
+    NeedPassword {
+        message: String,
+        /// ProxyJump hop (`user@host:port`) that needs it; absent for the final target.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop: Option<String>,
+    },
 
     #[error("{message}")]
     NeedPassphrase {
         message: String,
         #[serde(rename = "keyPath")]
         key_path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop: Option<String>,
     },
 
     #[error("{message}")]
-    HostKeyUnknown { message: String, fingerprint: String },
+    HostKeyUnknown {
+        message: String,
+        fingerprint: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop: Option<String>,
+    },
 
     #[error("{message}")]
     HostKeyChanged { message: String },
