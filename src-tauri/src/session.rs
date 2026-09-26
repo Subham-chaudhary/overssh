@@ -13,14 +13,15 @@ use std::time::Duration;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{self, HashAlg};
-use russh::{Channel, Disconnect};
+use russh::{Channel, ChannelStream, Disconnect};
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::forward::{self, RemoteRoutes};
 use crate::ssh_config;
 
 /// Alias for the channel `Msg` type used by `Handle`/`Channel`. Public so T4's
@@ -39,6 +40,19 @@ pub struct ConnectRequest {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    pub password: Option<String>,
+    pub passphrase: Option<String>,
+    pub accept_host_key: Option<bool>,
+    /// `-J` override: `a,b,user@c:2222`, or `none` for direct. Absent = use ssh config.
+    pub proxy_jump: Option<String>,
+    /// Per-jump-hop secrets/approvals, keyed by the `hop` string of the prompting error.
+    pub jump_auth: Option<HashMap<String, HopAuth>>,
+}
+
+/// Secrets / host-key approval for one ProxyJump hop (see `ConnectRequest::jump_auth`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HopAuth {
     pub password: Option<String>,
     pub passphrase: Option<String>,
     pub accept_host_key: Option<bool>,
@@ -70,6 +84,11 @@ pub struct Session {
     pub home: String,
     pub sftp: SftpSession,
     handle: Handle<ClientHandler>,
+    /// ProxyJump hops, kept alive for the life of the session (dropping one
+    /// would tear down the tunnel the target connection runs through).
+    jumps: Vec<Handle<ClientHandler>>,
+    /// Active `-R` forwards, shared with this connection's `ClientHandler`.
+    pub routes: RemoteRoutes,
 }
 
 impl Session {
@@ -94,6 +113,32 @@ impl Session {
     pub async fn close(&self) {
         let _ = self.sftp.close().await;
         let _ = self.handle.disconnect(Disconnect::ByApplication, "", "").await;
+        for jump in self.jumps.iter().rev() {
+            let _ = jump.disconnect(Disconnect::ByApplication, "", "").await;
+        }
+    }
+
+    /// `-L`: opens a `direct-tcpip` channel to `host:port` through the server.
+    pub async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u32,
+        originator_ip: &str,
+        originator_port: u32,
+    ) -> Result<Channel<Msg>, AppError> {
+        Ok(self
+            .handle
+            .channel_open_direct_tcpip(host, port, originator_ip, originator_port)
+            .await?)
+    }
+
+    /// `-R`: asks the server to listen on `address:port`. Returns the bound port.
+    pub async fn tcpip_forward(&self, address: &str, port: u32) -> Result<u32, AppError> {
+        Ok(self.handle.tcpip_forward(address, port).await?)
+    }
+
+    pub async fn cancel_tcpip_forward(&self, address: &str, port: u32) -> Result<(), AppError> {
+        Ok(self.handle.cancel_tcpip_forward(address, port).await?)
     }
 }
 
@@ -131,31 +176,124 @@ impl SessionManager {
     }
 }
 
+/// Cheap liveness probe (§13.4.A): one SFTP `realpath(".")` round trip with a
+/// short timeout. Any failure means the connection is dead (or gone from the
+/// manager); the frontend then treats it as a drop and reconnects.
+#[tauri::command]
+pub async fn session_ping(
+    manager: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<(), AppError> {
+    let session = manager.get(&session_id).await?;
+    match tokio::time::timeout(PING_TIMEOUT, session.sftp.canonicalize(".")).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(AppError::Connection { message: format!("ping failed: {e}") }),
+        Err(_) => Err(AppError::Connection { message: "ping timed out".into() }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connect flow
 // ---------------------------------------------------------------------------
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Keepalive every 20 s, give up after 3 unanswered probes: a dead link is
+/// noticed in roughly 60-80 s (auto-reconnect, §13.4.A).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const KEEPALIVE_MAX: usize = 3;
+/// How long `session_ping` waits for the server before calling the link dead.
+const PING_TIMEOUT: Duration = Duration::from_secs(8);
 const AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
+/// One SSH endpoint in a (possibly proxied) connection: a jump host or the final target.
+struct HopTarget {
+    hostname: String,
+    user: String,
+    port: u16,
+    identity_files: Vec<String>,
+    /// `user@hostname:port`; identifies a jump hop in prompts and in `jump_auth`.
+    key: String,
+    is_jump: bool,
+}
+
+/// Secrets / approvals the user supplied for one hop.
+#[derive(Default)]
+struct HopCreds {
+    password: Option<String>,
+    passphrase: Option<String>,
+    accept_host_key: bool,
+}
+
+/// A parsed `ProxyJump` entry: `[user@]host[:port]` (also `ssh://user@host:port`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpSpec {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+/// Parses a `ProxyJump` value (`a,b,user@c:2222`). `none`/empty -> empty chain.
+pub fn parse_jump_chain(spec: &str) -> Result<Vec<JumpSpec>, AppError> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut chain = Vec::new();
+    for raw in spec.split(',') {
+        let mut part = raw.trim();
+        let bad = || AppError::config(format!("Invalid ProxyJump hop '{raw}'"));
+        if part.is_empty() {
+            return Err(bad());
+        }
+        part = part.strip_prefix("ssh://").unwrap_or(part);
+        part = part.trim_end_matches('/');
+        let (user, rest) = match part.rsplit_once('@') {
+            Some((u, r)) if !u.is_empty() => (Some(u.to_string()), r),
+            _ => (None, part),
+        };
+        let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+            // [v6]:port
+            let (h, after) = inner.split_once(']').ok_or_else(bad)?;
+            let port = match after.strip_prefix(':') {
+                Some(p) => Some(p.parse::<u16>().map_err(|_| bad())?),
+                None if after.is_empty() => None,
+                None => return Err(bad()),
+            };
+            (h.to_string(), port)
+        } else if rest.matches(':').count() == 1 {
+            let (h, p) = rest.split_once(':').unwrap();
+            (h.to_string(), Some(p.parse::<u16>().map_err(|_| bad())?))
+        } else {
+            (rest.to_string(), None) // bare name, or an unbracketed IPv6 literal
+        };
+        if host.is_empty() {
+            return Err(bad());
+        }
+        chain.push(JumpSpec { user, host, port });
+    }
+    Ok(chain)
+}
+
+fn load_config() -> Result<ssh_config::SshConfig, AppError> {
+    let config_path =
+        ssh_config::default_config_path().unwrap_or_else(|| default_ssh_dir().join("config"));
+    Ok(ssh_config::parse_file(&config_path)?)
+}
+
 /// Resolve a `ConnectRequest` (alias or quick-connect fields), open the TCP
-/// connection, verify/learn the host key (TOFU), authenticate, then open the
-/// SFTP subsystem. See docs/GUIDE.md §3 item 2 and §6.
+/// connection (through any `ProxyJump` hops), verify/learn each host key (TOFU),
+/// authenticate each hop, then open the SFTP subsystem on the final target.
+/// See docs/GUIDE.md §3 item 2, §6 and §13.4.P.
 pub async fn connect(app: &AppHandle, req: ConnectRequest) -> Result<Session, AppError> {
     // --- Resolve target host + auth material -------------------------------
-    let (hostname, mut user, mut port, mut identity_files, label) = if let Some(alias) = &req.alias
+    let mut config_jump: Option<String> = None;
+    let mut config_proxy_command: Option<String> = None;
+    let (mut hostname, mut user, mut port, mut identity_files, label) = if let Some(alias) = &req.alias
     {
-        let config_path = ssh_config::default_config_path()
-            .unwrap_or_else(|| default_ssh_dir().join("config"));
-        let parsed = ssh_config::parse_file(&config_path)?;
+        let parsed = load_config()?;
         let host_cfg = parsed.resolve(alias);
-
-        if host_cfg.proxy_jump.is_some() {
-            return Err(AppError::config(format!(
-                "Host '{alias}' uses ProxyJump, which is not supported yet"
-            )));
-        }
+        config_jump = host_cfg.proxy_jump.clone();
+        config_proxy_command = host_cfg.proxy_command.clone();
 
         (
             host_cfg.hostname,
@@ -178,6 +316,11 @@ pub async fn connect(app: &AppHandle, req: ConnectRequest) -> Result<Session, Ap
         (hostname, req.user.clone(), req.port.unwrap_or(22), identity_files, label)
     };
 
+    // §11.3: explicit fields always override the resolved config value, even
+    // when an alias is set (previously `hostname` was silently ignored here).
+    if let Some(h) = &req.hostname {
+        hostname = h.clone();
+    }
     if let Some(u) = &req.user {
         user = Some(u.clone());
     }
@@ -191,150 +334,84 @@ pub async fn connect(app: &AppHandle, req: ConnectRequest) -> Result<Session, Ap
     }
     let user = user.unwrap_or_else(windows_username);
 
-    // --- Connect -------------------------------------------------------------
-    let session_id = Uuid::new_v4().to_string();
-    let host_key_status: Arc<StdMutex<Option<HostKeyStatus>>> = Arc::new(StdMutex::new(None));
-    let handler = ClientHandler {
-        host: hostname.clone(),
-        port,
-        known_hosts_path: default_known_hosts_path(),
-        accept_host_key: req.accept_host_key.unwrap_or(false),
-        host_key_status: host_key_status.clone(),
-        app: app.clone(),
-        session_id: session_id.clone(),
+    // --- ProxyJump chain (request override > config; `none` = direct) --------
+    let jump_value = req.proxy_jump.clone().or(config_jump);
+    let jump_chain = match &jump_value {
+        Some(v) => parse_jump_chain(v)?,
+        None => Vec::new(),
     };
+    if jump_chain.is_empty() && config_proxy_command.is_some() {
+        return Err(AppError::config(
+            "This host uses ProxyCommand, which OverSSH does not support. Use ProxyJump (-J) instead.",
+        ));
+    }
 
-    let config = Arc::new(client::Config {
-        keepalive_interval: Some(KEEPALIVE_INTERVAL),
-        ..Default::default()
-    });
-
-    let connect_fut = client::connect(config, (hostname.as_str(), port), handler);
-    let mut handle = match tokio::time::timeout(TCP_CONNECT_TIMEOUT, connect_fut).await {
-        Ok(Ok(handle)) => handle,
-        Ok(Err(err)) => {
-            // check_server_key may have rejected the key; that's a more specific
-            // error than the generic connection failure russh reports.
-            let status = host_key_status.lock().map(|mut s| s.take()).unwrap_or(None);
-            return Err(match status {
-                Some(HostKeyStatus::Unknown(fingerprint)) => AppError::HostKeyUnknown {
-                    message: format!("The authenticity of host '{hostname}' can't be established"),
-                    fingerprint,
-                },
-                Some(HostKeyStatus::Changed) => AppError::HostKeyChanged {
-                    message: format!(
-                        "REMOTE HOST IDENTIFICATION HAS CHANGED for '{hostname}'! This could indicate a man-in-the-middle attack."
-                    ),
-                },
-                None => err,
+    let mut targets: Vec<HopTarget> = Vec::with_capacity(jump_chain.len() + 1);
+    if !jump_chain.is_empty() {
+        let parsed = load_config().unwrap_or_default();
+        for hop in &jump_chain {
+            let cfg = parsed.resolve(&hop.host);
+            let hop_user = hop.user.clone().or(cfg.user).unwrap_or_else(windows_username);
+            let hop_port = hop.port.unwrap_or(cfg.port);
+            targets.push(HopTarget {
+                key: format!("{hop_user}@{}:{hop_port}", cfg.hostname),
+                hostname: cfg.hostname,
+                user: hop_user,
+                port: hop_port,
+                identity_files: cfg.identity_files,
+                is_jump: true,
             });
         }
-        Err(_elapsed) => {
-            return Err(AppError::Connection {
-                message: format!("Connection to {hostname}:{port} timed out"),
-            })
-        }
-    };
-
-    // --- Authenticate ----------------------------------------------------------
-    let best_rsa_hash = handle
-        .best_supported_rsa_hash()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(Some(HashAlg::Sha256));
-
-    let mut authenticated = false;
-
-    // 1. Explicit / config identity files (try the `.pub`-stripped path too).
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for raw in &identity_files {
-        let path = expand_tilde(raw);
-        if let Some(stripped) = raw.strip_suffix(".pub") {
-            candidates.push(expand_tilde(stripped));
-        }
-        candidates.push(path);
     }
-    for path in &candidates {
-        if !path.is_file() {
-            continue; // skip missing files silently, per §6
-        }
-        match try_private_key(&mut handle, &user, path, req.passphrase.as_deref(), best_rsa_hash)
-            .await
-        {
-            AuthOutcome::Success => {
-                authenticated = true;
-                break;
-            }
-            AuthOutcome::NeedPassphrase => {
-                return Err(AppError::NeedPassphrase {
-                    message: "The private key is encrypted and requires a passphrase".into(),
-                    key_path: path.display().to_string(),
-                });
-            }
-            AuthOutcome::Failed => continue,
-        }
-    }
+    targets.push(HopTarget {
+        key: format!("{user}@{hostname}:{port}"),
+        hostname: hostname.clone(),
+        user: user.clone(),
+        port,
+        identity_files,
+        is_jump: false,
+    });
 
-    // 2. Windows OpenSSH agent (skipped silently if not running).
-    if !authenticated {
-        authenticated = try_agent(&mut handle, &user, best_rsa_hash).await;
-    }
+    // --- Connect + authenticate hop by hop -------------------------------------
+    let session_id = Uuid::new_v4().to_string();
+    let routes = forward::new_routes();
+    let mut jumps: Vec<Handle<ClientHandler>> = Vec::new();
+    let mut stream: Option<ChannelStream<Msg>> = None;
+    let mut final_handle: Option<Handle<ClientHandler>> = None;
 
-    // 3. Default keys.
-    if !authenticated {
-        let ssh_dir = default_ssh_dir();
-        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
-            let path = ssh_dir.join(name);
-            if !path.is_file() {
-                continue;
+    for (i, target) in targets.iter().enumerate() {
+        let creds = if target.is_jump {
+            let a = req.jump_auth.as_ref().and_then(|m| m.get(&target.key));
+            HopCreds {
+                password: a.and_then(|a| a.password.clone()),
+                passphrase: a.and_then(|a| a.passphrase.clone()),
+                accept_host_key: a.and_then(|a| a.accept_host_key).unwrap_or(false),
             }
-            match try_private_key(
-                &mut handle,
-                &user,
-                &path,
-                req.passphrase.as_deref(),
-                best_rsa_hash,
-            )
-            .await
-            {
-                AuthOutcome::Success => {
-                    authenticated = true;
-                    break;
-                }
-                AuthOutcome::NeedPassphrase => {
-                    return Err(AppError::NeedPassphrase {
-                        message: "The private key is encrypted and requires a passphrase".into(),
-                        key_path: path.display().to_string(),
-                    });
-                }
-                AuthOutcome::Failed => continue,
+        } else {
+            HopCreds {
+                password: req.password.clone(),
+                passphrase: req.passphrase.clone(),
+                accept_host_key: req.accept_host_key.unwrap_or(false),
             }
+        };
+        let handle = dial_and_auth(app, &session_id, target, &creds, stream.take(), routes.clone()).await?;
+        if let Some(next) = targets.get(i + 1) {
+            let channel = handle
+                .channel_open_direct_tcpip(next.hostname.clone(), next.port as u32, "127.0.0.1", 0)
+                .await
+                .map_err(|e| AppError::Connection {
+                    message: format!(
+                        "Jump host {} could not open a connection to {}:{} ({e})",
+                        target.key, next.hostname, next.port
+                    ),
+                })?;
+            stream = Some(channel.into_stream());
+            jumps.push(handle);
+        } else {
+            final_handle = Some(handle);
         }
     }
-
-    // 4. Password.
-    if !authenticated {
-        match &req.password {
-            Some(password) => {
-                authenticated = handle
-                    .authenticate_password(&user, password.clone())
-                    .await?
-                    .success();
-            }
-            None => {
-                return Err(AppError::NeedPassword {
-                    message: format!("Password required for {user}@{hostname}"),
-                });
-            }
-        }
-    }
-
-    if !authenticated {
-        return Err(AppError::AuthFailed {
-            message: format!("Authentication failed for {user}@{hostname}"),
-        });
-    }
+    let handle = final_handle.expect("targets always has the final hop");
 
     // --- Open the SFTP subsystem once, use it for the life of the session ------
     let channel = handle.channel_open_session().await?;
@@ -351,7 +428,171 @@ pub async fn connect(app: &AppHandle, req: ConnectRequest) -> Result<Session, Ap
         home,
         sftp,
         handle,
+        jumps,
+        routes,
     })
+}
+
+/// Opens the transport to one hop (TCP, or over the previous hop's channel),
+/// checks its host key, and authenticates. Errors raised for a jump hop carry
+/// `hop` so the UI can say which host is asking.
+async fn dial_and_auth(
+    app: &AppHandle,
+    session_id: &str,
+    t: &HopTarget,
+    creds: &HopCreds,
+    stream: Option<ChannelStream<Msg>>,
+    routes: forward::RemoteRoutes,
+) -> Result<Handle<ClientHandler>, AppError> {
+    let hop = t.is_jump.then(|| t.key.clone());
+    let host_key_status: Arc<StdMutex<Option<HostKeyStatus>>> = Arc::new(StdMutex::new(None));
+    let handler = ClientHandler {
+        host: t.hostname.clone(),
+        port: t.port,
+        known_hosts_path: default_known_hosts_path(),
+        accept_host_key: creds.accept_host_key,
+        host_key_status: host_key_status.clone(),
+        app: app.clone(),
+        session_id: session_id.to_string(),
+        emit_closed: !t.is_jump,
+        routes,
+    };
+
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        ..Default::default()
+    });
+
+    let connect_fut = async {
+        match stream {
+            Some(s) => client::connect_stream(config, s, handler).await,
+            None => client::connect(config, (t.hostname.as_str(), t.port), handler).await,
+        }
+    };
+    let mut handle = match tokio::time::timeout(TCP_CONNECT_TIMEOUT, connect_fut).await {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(err)) => {
+            // check_server_key may have rejected the key; that's a more specific
+            // error than the generic connection failure russh reports.
+            let status = host_key_status.lock().map(|mut s| s.take()).unwrap_or(None);
+            let shown = if t.is_jump {
+                format!("jump host '{}'", t.hostname)
+            } else {
+                format!("'{}'", t.hostname)
+            };
+            return Err(match status {
+                Some(HostKeyStatus::Unknown(fingerprint)) => AppError::HostKeyUnknown {
+                    message: format!("The authenticity of {shown} can't be established"),
+                    fingerprint,
+                    hop,
+                },
+                Some(HostKeyStatus::Changed) => AppError::HostKeyChanged {
+                    message: format!(
+                        "REMOTE HOST IDENTIFICATION HAS CHANGED for {shown}! This could indicate a man-in-the-middle attack."
+                    ),
+                },
+                None => err,
+            });
+        }
+        Err(_elapsed) => {
+            return Err(AppError::Connection {
+                message: format!("Connection to {}:{} timed out", t.hostname, t.port),
+            })
+        }
+    };
+
+    authenticate(&mut handle, t, creds, hop).await?;
+    Ok(handle)
+}
+
+async fn authenticate(
+    handle: &mut Handle<ClientHandler>,
+    t: &HopTarget,
+    creds: &HopCreds,
+    hop: Option<String>,
+) -> Result<(), AppError> {
+    let user = t.user.as_str();
+    let best_rsa_hash = handle
+        .best_supported_rsa_hash()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(Some(HashAlg::Sha256));
+
+    let need_passphrase = |path: &Path| AppError::NeedPassphrase {
+        message: if t.is_jump {
+            format!(
+                "The private key for jump host {} is encrypted and requires a passphrase",
+                t.key
+            )
+        } else {
+            "The private key is encrypted and requires a passphrase".into()
+        },
+        key_path: path.display().to_string(),
+        hop: hop.clone(),
+    };
+
+    // 1. Explicit / config identity files (try the `.pub`-stripped path too).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for raw in &t.identity_files {
+        let path = expand_tilde(raw);
+        if let Some(stripped) = raw.strip_suffix(".pub") {
+            candidates.push(expand_tilde(stripped));
+        }
+        candidates.push(path);
+    }
+    for path in &candidates {
+        if !path.is_file() {
+            continue; // skip missing files silently, per §6
+        }
+        match try_private_key(handle, user, path, creds.passphrase.as_deref(), best_rsa_hash).await {
+            AuthOutcome::Success => return Ok(()),
+            AuthOutcome::NeedPassphrase => return Err(need_passphrase(path)),
+            AuthOutcome::Failed => continue,
+        }
+    }
+
+    // 2. Windows OpenSSH agent (skipped silently if not running).
+    if try_agent(handle, user, best_rsa_hash).await {
+        return Ok(());
+    }
+
+    // 3. Default keys.
+    let ssh_dir = default_ssh_dir();
+    for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+        let path = ssh_dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        match try_private_key(handle, user, &path, creds.passphrase.as_deref(), best_rsa_hash).await {
+            AuthOutcome::Success => return Ok(()),
+            AuthOutcome::NeedPassphrase => return Err(need_passphrase(&path)),
+            AuthOutcome::Failed => continue,
+        }
+    }
+
+    // 4. Password.
+    let which = if t.is_jump { " (jump host)" } else { "" };
+    match &creds.password {
+        Some(password) => {
+            if handle
+                .authenticate_password(user, password.clone())
+                .await?
+                .success()
+            {
+                Ok(())
+            } else {
+                Err(AppError::AuthFailed {
+                    message: format!("Authentication failed for {user}@{}{which}", t.hostname),
+                })
+            }
+        }
+        None => Err(AppError::NeedPassword {
+            message: format!("Password required for {user}@{}{which}", t.hostname),
+            hop,
+        }),
+    }
 }
 
 enum AuthOutcome {
@@ -437,6 +678,9 @@ struct ClientHandler {
     host_key_status: Arc<StdMutex<Option<HostKeyStatus>>>,
     app: AppHandle,
     session_id: String,
+    /// False for ProxyJump hops: only the final target's loss is a session close.
+    emit_closed: bool,
+    routes: RemoteRoutes,
 }
 
 impl client::Handler for ClientHandler {
@@ -484,6 +728,20 @@ impl client::Handler for ClientHandler {
         }
     }
 
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        forward::accept_remote(&self.routes, channel, connected_address, connected_port, reply).await;
+        Ok(())
+    }
+
     async fn disconnected(
         &mut self,
         reason: client::DisconnectReason<Self::Error>,
@@ -492,10 +750,19 @@ impl client::Handler for ClientHandler {
             client::DisconnectReason::ReceivedDisconnect(info) => info.message.clone(),
             client::DisconnectReason::Error(e) => e.to_string(),
         };
-        let _ = self.app.emit(
-            "session://closed",
-            serde_json::json!({ "sessionId": self.session_id, "reason": reason_message }),
-        );
+        if self.emit_closed {
+            let _ = self.app.emit(
+                "session://closed",
+                serde_json::json!({ "sessionId": self.session_id, "reason": reason_message }),
+            );
+            // Forwards die with their connection.
+            if let Some(fw) = self.app.try_state::<forward::ForwardManager>() {
+                let fw = fw.inner().clone();
+                let app = self.app.clone();
+                let sid = self.session_id.clone();
+                tokio::spawn(async move { fw.stop_for_session(&app, &sid).await });
+            }
+        }
         match reason {
             client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
             client::DisconnectReason::Error(e) => Err(e),
@@ -535,5 +802,50 @@ fn expand_tilde(path: &str) -> PathBuf {
         home_dir()
     } else {
         PathBuf::from(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn j(user: Option<&str>, host: &str, port: Option<u16>) -> JumpSpec {
+        JumpSpec { user: user.map(String::from), host: host.into(), port }
+    }
+
+    #[test]
+    fn jump_none_and_empty_mean_direct() {
+        assert!(parse_jump_chain("none").unwrap().is_empty());
+        assert!(parse_jump_chain("  NONE ").unwrap().is_empty());
+        assert!(parse_jump_chain("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn jump_single_and_chain() {
+        assert_eq!(parse_jump_chain("bastion").unwrap(), vec![j(None, "bastion", None)]);
+        assert_eq!(
+            parse_jump_chain("a, bob@b:2222 ,c").unwrap(),
+            vec![j(None, "a", None), j(Some("bob"), "b", Some(2222)), j(None, "c", None)]
+        );
+    }
+
+    #[test]
+    fn jump_uri_and_ipv6() {
+        assert_eq!(
+            parse_jump_chain("ssh://u@h:22").unwrap(),
+            vec![j(Some("u"), "h", Some(22))]
+        );
+        assert_eq!(
+            parse_jump_chain("u@[::1]:2200").unwrap(),
+            vec![j(Some("u"), "::1", Some(2200))]
+        );
+        assert_eq!(parse_jump_chain("[fe80::1]").unwrap(), vec![j(None, "fe80::1", None)]);
+    }
+
+    #[test]
+    fn jump_rejects_garbage() {
+        assert!(parse_jump_chain("a,,b").is_err());
+        assert!(parse_jump_chain("host:notaport").is_err());
+        assert!(parse_jump_chain("u@").is_err());
     }
 }
