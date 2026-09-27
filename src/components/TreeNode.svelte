@@ -1,7 +1,12 @@
 <script lang="ts">
   import { app } from "../lib/stores.svelte";
+  import { isCut, isRowSelected, modifierSelect } from "../lib/fileops.svelte";
   import type { FileEntry } from "../lib/types";
   import TreeNode from "./TreeNode.svelte";
+  import Loader from "./Loader.svelte";
+  import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
+  import FileTypeIcon from "./FileTypeIcon.svelte";
+  import CornerDownRightIcon from "@lucide/svelte/icons/corner-down-right";
 
   let {
     entry,
@@ -22,13 +27,14 @@
   // Expand/selection/children state lives in the store (ExplorerState), keyed
   // by path, so a mutation only needs to refresh the affected node — see
   // `app.refreshDir` — instead of collapsing/rebuilding the whole tree.
-  const ex = $derived(app.explorers[sessionId]);
+  const ex = $derived(app.workspaces[sessionId]?.explorer);
   const isDir = $derived(
     entry.kind === "dir" || (entry.kind === "symlink" && entry.linkTargetIsDir === true),
   );
   const expanded = $derived(ex?.expanded.has(entry.path) ?? false);
   const node = $derived(ex?.children[entry.path]);
-  const selected = $derived(ex?.selected === entry.path);
+  const selected = $derived(isRowSelected(sessionId, entry.path));
+  const cut = $derived(isCut(sessionId, entry.path));
   const isDropTarget = $derived(isDir && ex?.dropTarget === entry.path);
   const visibleChildren = $derived(
     node?.entries ? (ex?.showHidden ? node.entries : node.entries.filter((c) => !c.isHidden)) : [],
@@ -38,7 +44,8 @@
     app.selectPath(sessionId, entry.path);
   }
 
-  function onClick(): void {
+  function onClick(e?: MouseEvent): void {
+    if (e && modifierSelect(sessionId, entry.path, e)) return;
     select();
     if (isDir) {
       void app.toggleExpandDir(sessionId, entry.path);
@@ -61,17 +68,15 @@
   function rowContextMenu(e: MouseEvent): void {
     e.preventDefault();
     e.stopPropagation();
-    select();
+    if (!selected) select();
     onContextMenu(entry, parentDir, e.clientX, e.clientY);
   }
 </script>
 
-<div class="node">
+<div>
   <div
-    class="row"
-    class:selected
-    class:drop-target={isDropTarget}
-    style={`padding-left:${depth * 14 + 6}px`}
+    class={`relative flex h-[22px] cursor-pointer items-center gap-1 border border-transparent pr-1.5 text-[13px] whitespace-nowrap text-sidebar-foreground hover:bg-accent ${selected ? "bg-accent" : ""} ${isDropTarget ? "border-primary bg-accent" : ""} ${cut ? "opacity-50" : ""}`}
+    style={`padding-left:${depth * 14 + 4}px`}
     role="treeitem"
     aria-expanded={isDir ? expanded : undefined}
     aria-selected={selected}
@@ -80,39 +85,41 @@
     data-parent={parentDir}
     data-dir={isDir}
     data-depth={depth}
-    onclick={onClick}
+    onclick={(e) => onClick(e)}
     ondblclick={onDblClick}
     onkeydown={rowKeydown}
     oncontextmenu={rowContextMenu}
   >
+    {#each Array(depth) as _, i (i)}
+      <span class="pointer-events-none absolute top-0 bottom-0 w-px bg-border/70" style={`left:${i * 14 + 11}px`}></span>
+    {/each}
     {#if isDir}
-      <span class="arrow" class:open={expanded}>▸</span>
+      <ChevronRightIcon
+        class={`size-3.5 shrink-0 text-muted-foreground transition-transform duration-100 ${expanded ? "rotate-90" : ""}`}
+      />
     {:else}
-      <span class="arrow spacer"></span>
+      <span class="inline-block size-3.5 shrink-0"></span>
     {/if}
-    <span class="icon" aria-hidden="true">
-      {#if isDir}
-        <svg viewBox="0 0 16 16" width="13" height="13">
-          <path
-            fill="currentColor"
-            d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.379a1.5 1.5 0 0 1 1.06.44l.622.62A1.5 1.5 0 0 0 8.62 3.5H13.5A1.5 1.5 0 0 1 15 5v6.5A1.5 1.5 0 0 1 13.5 13h-11A1.5 1.5 0 0 1 1 11.5v-8Z"
-          />
-        </svg>
-      {:else}
-        <svg viewBox="0 0 16 16" width="13" height="13">
-          <path fill="currentColor" opacity="0.85" d="M4 1.5A1.5 1.5 0 0 1 5.5 0H9l4 4v10.5A1.5 1.5 0 0 1 11.5 16h-6A1.5 1.5 0 0 1 4 14.5v-13Z" />
-          <path fill="currentColor" opacity="0.5" d="M9 0v3.5A1.5 1.5 0 0 0 10.5 5H14L9 0Z" />
-        </svg>
-      {/if}
+    <span class="flex shrink-0 items-center text-muted-foreground">
+      <FileTypeIcon name={entry.name} {isDir} isOpen={expanded} class="size-4" />
     </span>
-    <span class="name">{entry.name}</span>
-    {#if entry.kind === "symlink"}<span class="hint">→</span>{/if}
+    <span class="overflow-hidden text-ellipsis">{entry.name}</span>
+    {#if entry.kind === "symlink"}
+      <CornerDownRightIcon class="size-3 shrink-0 text-muted-foreground" />
+    {/if}
   </div>
   {#if isDir && expanded}
     {#if node?.loading}
-      <div class="state muted" style={`padding-left:${(depth + 1) * 14 + 6}px`}>Loading…</div>
+      <div class="py-0.5 text-[11px]" style={`padding-left:${(depth + 1) * 14 + 4}px`}>
+        <Loader />
+      </div>
     {:else if node?.error}
-      <div class="state error" style={`padding-left:${(depth + 1) * 14 + 6}px`}>{node.error}</div>
+      <div
+        class="py-0.5 text-[11px] text-destructive"
+        style={`padding-left:${(depth + 1) * 14 + 4}px`}
+      >
+        {node.error}
+      </div>
     {:else}
       {#each visibleChildren as child (child.path)}
         <TreeNode
@@ -127,65 +134,3 @@
     {/if}
   {/if}
 </div>
-
-<style>
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 6px 2px 0;
-    cursor: pointer;
-    white-space: nowrap;
-    color: var(--fg);
-    border: 1px solid transparent;
-  }
-  .row:hover {
-    background: var(--bg-hover);
-  }
-  .row.selected {
-    background: var(--bg-active);
-    color: var(--fg-strong);
-  }
-  .row.drop-target {
-    border-color: var(--accent);
-    background: var(--bg-hover);
-  }
-  .arrow {
-    width: 12px;
-    flex: none;
-    display: inline-block;
-    font-size: 9px;
-    color: var(--muted);
-    transition: transform 0.1s ease;
-  }
-  .arrow.open {
-    transform: rotate(90deg);
-  }
-  .arrow.spacer {
-    visibility: hidden;
-  }
-  .icon {
-    flex: none;
-    display: inline-flex;
-    color: var(--accent);
-  }
-  .name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .hint {
-    color: var(--muted);
-    font-size: 10px;
-  }
-  .state {
-    padding-top: 2px;
-    padding-bottom: 2px;
-    font-size: 11px;
-  }
-  .muted {
-    color: var(--muted);
-  }
-  .error {
-    color: var(--danger);
-  }
-</style>

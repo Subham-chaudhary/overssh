@@ -141,6 +141,244 @@ pub async fn stat(session: &Session, path: &str) -> Result<FileEntry, AppError> 
     Ok(entry)
 }
 
+// ---------------------------------------------------------------------------
+// Properties dialog: `file_info` / `dir_size` (docs/GUIDE.md §14.4.X)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileInfo {
+    pub path: String,
+    pub name: String,
+    pub kind: FileKind,
+    /// Symlink only: what `readlink` returns.
+    pub link_target: Option<String>,
+    /// Symlink only: kind of the resolved target; `None` for a dangling link.
+    pub link_target_kind: Option<FileKind>,
+    pub size: u64,
+    /// Raw mode bits (type bits included), when the server reported them.
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub user: Option<String>,
+    pub group: Option<String>,
+    pub atime: Option<i64>,
+    pub mtime: Option<i64>,
+    /// Status-change time (exec `stat` only).
+    pub ctime: Option<i64>,
+    /// Birth time (exec `stat`, when the filesystem has one).
+    pub btime: Option<i64>,
+    pub hard_links: Option<u64>,
+    pub mime: Option<String>,
+    pub lines: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ExecInfo {
+    user: Option<String>,
+    group: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    ctime: Option<i64>,
+    btime: Option<i64>,
+    hard_links: Option<u64>,
+    mime: Option<String>,
+    lines: Option<u64>,
+}
+
+/// Parses the `key=value` lines printed by [`INFO_SCRIPT`]. Anything missing or
+/// malformed stays `None` (the exec half of the dialog is best effort).
+fn parse_exec_info(out: &str) -> ExecInfo {
+    let mut info = ExecInfo::default();
+    for line in out.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            // %U|%G|%Z|%W|%h|%u|%g
+            "stat" => {
+                let f: Vec<&str> = value.split('|').collect();
+                let name = |s: Option<&&str>| {
+                    s.map(|v| v.to_string()).filter(|v| !v.is_empty() && v != "UNKNOWN")
+                };
+                info.user = name(f.first());
+                info.group = name(f.get(1));
+                info.ctime = f.get(2).and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0);
+                info.btime = f.get(3).and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0);
+                info.hard_links = f.get(4).and_then(|v| v.parse().ok());
+                info.uid = f.get(5).and_then(|v| v.parse().ok());
+                info.gid = f.get(6).and_then(|v| v.parse().ok());
+            }
+            "mime" => {
+                if value.contains('/') && !value.contains(' ') {
+                    info.mime = Some(value.to_string());
+                }
+            }
+            "lines" => info.lines = value.parse().ok(),
+            _ => {}
+        }
+    }
+    info
+}
+
+/// `$1` = path, `$2` = "1" to count lines when the file looks like text.
+const INFO_SCRIPT: &str = r#"p="$1"
+export LC_ALL=C
+printf 'stat=%s\n' "$(stat -c '%U|%G|%Z|%W|%h|%u|%g' -- "$p" 2>/dev/null)"
+m="$(file -b -L --mime-type -- "$p" 2>/dev/null)"
+printf 'mime=%s\n' "$m"
+if [ "$2" = 1 ] && [ -f "$p" ]; then
+  case "$m" in
+    text/*|application/json|application/xml|application/javascript|application/x-sh*|inode/x-empty|"")
+      printf 'lines=%s\n' "$(wc -l < "$p" 2>/dev/null | tr -d ' ')" ;;
+  esac
+fi
+"#;
+
+const LINE_COUNT_MAX_SIZE: u64 = 20 * 1024 * 1024;
+const EXEC_OUT_CAP: usize = 64 * 1024;
+
+/// Runs `sh -c <script> sh <args…>` on a fresh exec channel. Returns stdout and
+/// the exit status. Fails only if the channel itself cannot be used.
+async fn exec_sh(
+    session: &Session,
+    script: &str,
+    args: &[&str],
+) -> Result<(String, Option<u32>), AppError> {
+    let mut cmd = format!("sh -c {} sh", shell_quote(script));
+    for a in args {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(a));
+    }
+    let mut channel = session.open_channel().await?;
+    channel
+        .exec(true, cmd.into_bytes())
+        .await
+        .map_err(|e| AppError::Io { message: e.to_string() })?;
+    let _ = channel.eof().await;
+    let mut out: Vec<u8> = Vec::new();
+    let mut code = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => {
+                if out.len() < EXEC_OUT_CAP {
+                    out.extend_from_slice(&data);
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    Ok((String::from_utf8_lossy(&out).into_owned(), code))
+}
+
+/// SFTP lstat (+ readlink) plus a best-effort exec `stat`/`file`/`wc` for owner
+/// names, ctime, mime type and line count. The exec half never fails the call.
+pub async fn file_info(session: &Session, path: &str) -> Result<FileInfo, AppError> {
+    let meta = session.sftp.symlink_metadata(path).await?;
+    let kind: FileKind = meta.file_type().into();
+    let size = meta.size.unwrap_or(0);
+
+    let (mut link_target, mut link_target_kind) = (None, None);
+    if kind == FileKind::Symlink {
+        link_target = session.sftp.read_link(path).await.ok();
+        link_target_kind = session.sftp.metadata(path).await.ok().map(|m| m.file_type().into());
+    }
+
+    let is_file = kind == FileKind::File
+        || (kind == FileKind::Symlink && link_target_kind == Some(FileKind::File));
+    let want_lines = if is_file && size <= LINE_COUNT_MAX_SIZE { "1" } else { "0" };
+    let exec = match exec_sh(session, INFO_SCRIPT, &[path, want_lines]).await {
+        Ok((out, _)) => parse_exec_info(&out),
+        Err(_) => ExecInfo::default(),
+    };
+
+    Ok(FileInfo {
+        path: path.to_string(),
+        name: posix_basename(path),
+        kind,
+        link_target,
+        link_target_kind,
+        size,
+        mode: meta.permissions,
+        uid: meta.uid.or(exec.uid),
+        gid: meta.gid.or(exec.gid),
+        user: meta.user.clone().filter(|u| !u.is_empty()).or(exec.user),
+        group: meta.group.clone().filter(|g| !g.is_empty()).or(exec.group),
+        atime: meta.atime.map(|t| t as i64),
+        mtime: meta.mtime.map(|t| t as i64),
+        ctime: exec.ctime,
+        btime: exec.btime,
+        hard_links: exec.hard_links,
+        mime: exec.mime,
+        lines: exec.lines,
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirSize {
+    pub bytes: u64,
+    pub files: u64,
+    pub dirs: u64,
+    /// `du` reported errors (e.g. unreadable subdirectories): the total is a lower bound.
+    pub partial: bool,
+}
+
+/// `$1` = path. Prints `bytes=` (GNU `du -sb`) or `kb=` (`du -sk`), `files=`, `dirs=`.
+const DU_SCRIPT: &str = r#"p="$1"
+export LC_ALL=C
+T=""; command -v timeout >/dev/null 2>&1 && T="timeout 120"
+b="$($T du -sb -- "$p" 2>/dev/null | tail -n 1 | cut -f1)"
+if [ -n "$b" ]; then
+  printf 'bytes=%s\n' "$b"
+else
+  printf 'kb=%s\n' "$($T du -sk -- "$p" 2>/dev/null | tail -n 1 | cut -f1)"
+fi
+printf 'files=%s\n' "$($T find "$p" -type f 2>/dev/null | wc -l | tr -d ' ')"
+printf 'dirs=%s\n' "$($T find "$p" -type d 2>/dev/null | wc -l | tr -d ' ')"
+"#;
+
+fn parse_dir_size(out: &str, code: Option<u32>) -> Option<DirSize> {
+    let mut size = DirSize::default();
+    let mut have_bytes = false;
+    for line in out.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim();
+        match k {
+            "bytes" => {
+                if let Ok(n) = v.parse::<u64>() {
+                    size.bytes = n;
+                    have_bytes = true;
+                }
+            }
+            "kb" => {
+                if let Ok(n) = v.parse::<u64>() {
+                    size.bytes = n.saturating_mul(1024);
+                    have_bytes = true;
+                }
+            }
+            "files" => size.files = v.parse().unwrap_or(0),
+            // `find` lists the root itself as a directory.
+            "dirs" => size.dirs = v.parse::<u64>().unwrap_or(1).saturating_sub(1),
+            _ => {}
+        }
+    }
+    size.partial = code != Some(0);
+    have_bytes.then_some(size)
+}
+
+/// On-demand folder size (`du`) and file/folder counts (`find`) over an exec channel.
+pub async fn dir_size(session: &Session, path: &str) -> Result<DirSize, AppError> {
+    let (out, code) = exec_sh(session, DU_SCRIPT, &[path]).await?;
+    parse_dir_size(&out, code).ok_or_else(|| AppError::Other {
+        message: "could not calculate the folder size on the server".to_string(),
+    })
+}
+
 pub async fn read_file(session: &Session, path: &str) -> Result<FileContent, AppError> {
     let meta = session.sftp.metadata(path).await?;
     let size = meta.size.unwrap_or(0);
@@ -235,8 +473,148 @@ pub async fn create_dir(session: &Session, path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Renames/moves `from` to `to`. Fails with `Conflict` if `to` already exists
+/// (never overwrites; SFTP servers disagree on whether rename replaces).
 pub async fn rename(session: &Session, from: &str, to: &str) -> Result<(), AppError> {
+    if from == to {
+        return Ok(());
+    }
+    if is_inside(from, to) {
+        return Err(AppError::conflict(format!("cannot move {from} into itself")));
+    }
+    if session.sftp.try_exists(to).await? {
+        return Err(AppError::conflict(format!("{to} already exists")));
+    }
     session.sftp.rename(from, to).await?;
+    Ok(())
+}
+
+/// True when `path` is `dir` itself or lies below it (POSIX string compare).
+fn is_inside(dir: &str, path: &str) -> bool {
+    let d = dir.trim_end_matches('/');
+    path == d || path.starts_with(&format!("{d}/"))
+}
+
+/// Recursive copy of a file or directory (`cp -a` semantics). Fails with
+/// `Conflict` if `to` exists or `to` is inside `from`. Prefers a server-side
+/// `cp -a -- from to` on an exec channel; if the channel cannot run it (exec
+/// refused, no `cp`, no exit status) it falls back to an SFTP read/write walk
+/// (which skips symlinks and does not preserve ownership/mtime).
+pub async fn copy_path(session: &Session, from: &str, to: &str) -> Result<(), AppError> {
+    if is_inside(from, to) {
+        return Err(AppError::conflict(format!("cannot copy {from} into itself")));
+    }
+    if session.sftp.try_exists(to).await? {
+        return Err(AppError::conflict(format!("{to} already exists")));
+    }
+    // Make sure the source exists so a missing file reports NotFound.
+    session.sftp.symlink_metadata(from).await?;
+
+    match cp_via_exec(session, from, to).await {
+        Ok(()) => Ok(()),
+        Err(CpFailure::Real(err)) => Err(err),
+        Err(CpFailure::Unavailable) => {
+            // A failed exec may have left a partial copy; only the fallback's own
+            // create_dir/open will tell us if that matters.
+            copy_via_sftp(session, from, to).await
+        }
+    }
+}
+
+enum CpFailure {
+    /// The exec route cannot be used; try SFTP.
+    Unavailable,
+    /// `cp` ran and failed; report it.
+    Real(AppError),
+}
+
+async fn cp_via_exec(session: &Session, from: &str, to: &str) -> Result<(), CpFailure> {
+    let mut channel = session.open_channel().await.map_err(|_| CpFailure::Unavailable)?;
+    let cmd = format!("cp -a -- {} {}", shell_quote(from), shell_quote(to));
+    channel.exec(true, cmd.into_bytes()).await.map_err(|_| CpFailure::Unavailable)?;
+    let _ = channel.eof().await;
+
+    let mut stderr = String::new();
+    let mut exit_status: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                stderr.push_str(&String::from_utf8_lossy(&data));
+            }
+            ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    match exit_status {
+        Some(0) => Ok(()),
+        None | Some(126) | Some(127) => Err(CpFailure::Unavailable),
+        Some(_) => {
+            let text = stderr.trim();
+            let lower = text.to_lowercase();
+            let message = if text.is_empty() { "cp failed".to_string() } else { text.to_string() };
+            Err(CpFailure::Real(if lower.contains("permission denied") {
+                AppError::PermissionDenied { message }
+            } else {
+                AppError::Io { message }
+            }))
+        }
+    }
+}
+
+async fn copy_file_sftp(session: &Session, from: &str, to: &str) -> Result<(), AppError> {
+    let mut src = session.sftp.open(from).await?;
+    let mut dst = session
+        .sftp
+        .open_with_flags(to, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE)
+        .await?;
+    let mut chunk = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = src.read(&mut chunk).await.map_err(|e| AppError::Io { message: e.to_string() })?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&chunk[..n]).await.map_err(|e| AppError::Io { message: e.to_string() })?;
+    }
+    let _ = dst.flush().await;
+    dst.close().await.map_err(|e| AppError::Io { message: e.to_string() })?;
+    let _ = src.close().await;
+    if let Ok(meta) = session.sftp.metadata(from).await {
+        if let Some(mode) = meta.permissions {
+            let mut attrs = FileAttributes::empty();
+            attrs.permissions = Some(mode & 0o7777);
+            let _ = session.sftp.set_metadata(to, attrs).await;
+        }
+    }
+    Ok(())
+}
+
+async fn copy_via_sftp(session: &Session, from: &str, to: &str) -> Result<(), AppError> {
+    let meta = session.sftp.metadata(from).await?;
+    if !meta.is_dir() {
+        return copy_file_sftp(session, from, to).await;
+    }
+    session.sftp.create_dir(to).await?;
+    let mut stack = vec![(from.to_string(), to.to_string())];
+    while let Some((src_dir, dst_dir)) = stack.pop() {
+        let children: Vec<_> = session.sftp.read_dir(&src_dir).await?.collect();
+        for child in children {
+            let name = child.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let src_path = join_posix(&src_dir, &name);
+            let dst_path = join_posix(&dst_dir, &name);
+            match child.file_type() {
+                FileType::Dir => {
+                    session.sftp.create_dir(&dst_path).await?;
+                    stack.push((src_path, dst_path));
+                }
+                FileType::File => copy_file_sftp(session, &src_path, &dst_path).await?,
+                _ => {} // symlinks/specials are skipped in the fallback
+            }
+        }
+    }
     Ok(())
 }
 
@@ -277,58 +655,6 @@ pub async fn remove(session: &Session, path: &str, recursive: bool) -> Result<()
         session.sftp.remove_dir(&dir).await?;
     }
     Ok(())
-}
-
-/// Files only (MVP), per §5.2.
-pub async fn download(session: &Session, remote_path: &str, local_path: &str) -> Result<(), AppError> {
-    let mut remote_file = session.sftp.open(remote_path).await?;
-    let mut local_file = tokio::fs::File::create(local_path).await?;
-
-    let mut chunk = [0u8; CHUNK_SIZE];
-    loop {
-        let n = remote_file
-            .read(&mut chunk)
-            .await
-            .map_err(|e| AppError::Io { message: e.to_string() })?;
-        if n == 0 {
-            break;
-        }
-        local_file.write_all(&chunk[..n]).await?;
-    }
-    local_file.flush().await?;
-    let _ = remote_file.close().await;
-    Ok(())
-}
-
-/// Files only (MVP), per §5.2. Returns the resulting remote path.
-pub async fn upload(session: &Session, local_path: &str, remote_dir: &str) -> Result<String, AppError> {
-    let file_name = std::path::Path::new(local_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| AppError::config(format!("'{local_path}' has no file name")))?;
-    let remote_path = join_posix(remote_dir, &file_name);
-
-    let mut local_file = tokio::fs::File::open(local_path).await?;
-    let mut remote_file = session
-        .sftp
-        .open_with_flags(&remote_path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
-        .await?;
-
-    let mut chunk = [0u8; CHUNK_SIZE];
-    loop {
-        let n = local_file.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        remote_file
-            .write_all(&chunk[..n])
-            .await
-            .map_err(|e| AppError::Io { message: e.to_string() })?;
-    }
-    let _ = remote_file.flush().await;
-    remote_file.close().await.map_err(|e| AppError::Io { message: e.to_string() })?;
-
-    Ok(remote_path)
 }
 
 /// Save-as-root (GUIDE §3 item 8): uploads `content` to a remote temp file
@@ -433,5 +759,52 @@ async fn sudo_move(
             },
         }),
         None => Err(AppError::Io { message: "sudo channel closed unexpectedly".to_string() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_inside;
+
+    #[test]
+    fn is_inside_matches_self_and_descendants_only() {
+        assert!(is_inside("/a/b", "/a/b"));
+        assert!(is_inside("/a/b", "/a/b/c/d"));
+        assert!(is_inside("/a/b/", "/a/b/c"));
+        assert!(!is_inside("/a/b", "/a/bc"));
+        assert!(!is_inside("/a/b", "/a"));
+    }
+
+    #[test]
+    fn parse_exec_info_reads_stat_mime_lines() {
+        let info = super::parse_exec_info(
+            "stat=root|wheel|1700000000|0|2|0|0\nmime=text/x-shellscript\nlines=42\n",
+        );
+        assert_eq!(info.user.as_deref(), Some("root"));
+        assert_eq!(info.group.as_deref(), Some("wheel"));
+        assert_eq!(info.ctime, Some(1700000000));
+        assert_eq!(info.btime, None);
+        assert_eq!(info.hard_links, Some(2));
+        assert_eq!(info.mime.as_deref(), Some("text/x-shellscript"));
+        assert_eq!(info.lines, Some(42));
+    }
+
+    #[test]
+    fn parse_exec_info_tolerates_missing_tools() {
+        let info = super::parse_exec_info("stat=\nmime=cannot open file\n");
+        assert_eq!(info, super::ExecInfo::default());
+        let unknown = super::parse_exec_info("stat=UNKNOWN|UNKNOWN|5|6|1|1000|1000\n");
+        assert_eq!(unknown.user, None);
+        assert_eq!(unknown.uid, Some(1000));
+        assert_eq!(unknown.btime, Some(6));
+    }
+
+    #[test]
+    fn parse_dir_size_handles_bytes_and_kb() {
+        let a = super::parse_dir_size("bytes=2048\nfiles=3\ndirs=2\n", Some(0)).unwrap();
+        assert_eq!((a.bytes, a.files, a.dirs, a.partial), (2048, 3, 1, false));
+        let b = super::parse_dir_size("kb=4\nfiles=1\ndirs=1\n", Some(1)).unwrap();
+        assert_eq!((b.bytes, b.dirs, b.partial), (4096, 0, true));
+        assert!(super::parse_dir_size("files=1\n", Some(0)).is_none());
     }
 }
