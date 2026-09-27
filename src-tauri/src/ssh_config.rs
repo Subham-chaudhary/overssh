@@ -21,6 +21,8 @@ pub struct HostConfig {
     /// `~` expanded, in config order, may be empty.
     pub identity_files: Vec<String>,
     pub proxy_jump: Option<String>,
+    /// `ProxyCommand` (unsupported; only recorded so connect can say so clearly).
+    pub proxy_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +390,7 @@ impl SshConfig {
             port: 22,
             identity_files: Vec::new(),
             proxy_jump: None,
+            proxy_command: None,
         };
 
         // OpenSSH reads top to bottom and keeps the first value obtained, so the
@@ -460,6 +463,10 @@ fn apply_settings(
             },
             "proxyjump" if !seen.contains(key) => {
                 config.proxy_jump = Some(val.clone());
+                true
+            }
+            "proxycommand" if !seen.contains(key) => {
+                config.proxy_command = Some(val.clone());
                 true
             }
             _ => false,
@@ -906,6 +913,16 @@ Host chalkdoor-vm-dev
         let resolved = config.resolve("test");
 
         assert_eq!(resolved.proxy_jump, Some("bastion".to_string()));
+    }
+
+    #[test]
+    fn test_proxy_command_recorded() {
+        let config = parse_str("Host t
+    ProxyCommand ssh -W %h:%p gw
+", Path::new("."));
+        let resolved = config.resolve("t");
+        assert!(resolved.proxy_command.is_some());
+        assert_eq!(resolved.proxy_jump, None);
     }
 
     #[test]
