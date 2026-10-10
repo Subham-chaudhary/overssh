@@ -107,7 +107,7 @@ export const scenario: Scenario = {
     );
 
     // Switching Explorer -> Commands -> Hosts must not blank the panel again.
-    await page.getByRole("button", { name: "Explorer" }).click();
+    await page.getByRole("button", { name: "Explorer", exact: true }).click();
     await page.getByRole("button", { name: "Commands" }).click();
     await page.getByRole("button", { name: "Hosts" }).click();
     await waitFor(async () => (await page.locator('[data-testid="host-row"]').count()) === 3, "config hosts still 3");

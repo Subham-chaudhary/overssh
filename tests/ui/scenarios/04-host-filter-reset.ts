@@ -24,7 +24,7 @@ export const scenario: Scenario = {
     // Also exercise it a second time (switch views in between) — this is
     // exactly the sequence that used to poison profiles.svelte.ts's state
     // and permanently break reactivity in this panel.
-    await page.getByRole("button", { name: "Explorer" }).click();
+    await page.getByRole("button", { name: "Explorer", exact: true }).click();
     await page.getByRole("button", { name: "Hosts" }).click();
     await filterInput.fill("beta");
     await waitFor(async () => (await page.locator('[data-testid="host-row"]').count()) === 1, "only beta matches");

@@ -1,9 +1,11 @@
 mod commands;
 mod cron;
 mod diskusage;
+mod docker;
 mod error;
 mod forward;
 mod git;
+mod localfs;
 mod monitor;
 mod recording;
 mod logs;
@@ -12,6 +14,7 @@ mod session;
 mod sftp;
 mod ssh_config;
 mod store;
+mod systemd;
 mod terminal;
 mod transfer;
 mod tray;
@@ -31,8 +34,14 @@ pub fn run() {
         .manage(search::SearchManager::new())
         .manage(transfer::TransferManager::new())
         .manage(diskusage::DuManager::new())
+        .manage(docker::DockerManager::new())
         .setup(|app| {
-            tray::setup(app)?;
+            // No tray (e.g. a Linux desktop without a status area) is not a
+            // reason to refuse to start; closing then simply quits (below).
+            if let Err(_e) = tray::setup(app) {
+                #[cfg(debug_assertions)]
+                eprintln!("tray unavailable: {_e}");
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -41,7 +50,9 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     use tauri::Manager;
-                    if window.app_handle().state::<forward::ForwardManager>().should_hide_on_close() {
+                    // Hiding without a tray icon would leave no way back to the window.
+                    let has_tray = window.app_handle().tray_by_id("main").is_some();
+                    if has_tray && window.app_handle().state::<forward::ForwardManager>().should_hide_on_close() {
                         api.prevent_close();
                         let _ = window.hide();
                     }
@@ -99,6 +110,13 @@ pub fn run() {
             cron::cron_read,
             cron::cron_write,
             git::git_run,
+            docker::docker_run,
+            docker::docker_logs_start,
+            docker::docker_logs_stop,
+            docker::docker_stats_start,
+            docker::docker_stats_stop,
+            docker::docker_events_start,
+            docker::docker_events_stop,
             diskusage::du_start,
             diskusage::du_cancel,
             store::load_store,
@@ -108,6 +126,16 @@ pub fn run() {
             forward::forward_list,
             forward::forward_set_close_to_tray,
             session::session_ping,
+            systemd::systemd_probe,
+            systemd::systemd_list,
+            systemd::systemd_timers,
+            systemd::systemd_failed,
+            systemd::systemd_show,
+            systemd::systemd_stats,
+            systemd::systemd_text,
+            systemd::systemd_action,
+            localfs::local_write_text,
+            localfs::local_read_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

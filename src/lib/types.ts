@@ -101,6 +101,8 @@ export interface Settings {
     radius: "sharp" | "default" | "round"; // 'default'
     /** Terminal cursor and selection follow the accent. */
     terminalAccent: boolean; // true
+    /** UI motion (docs/GUIDE.md §15.3.A): full, reduced (opacity only), off. */
+    motion: "full" | "reduced" | "off"; // "full"
   };
   editor: {
     themeOverride: ThemeId | null;
@@ -164,6 +166,16 @@ export interface Settings {
     diffSideBySide: boolean; // true: side-by-side diff, false = inline
     ignoreWhitespace: boolean; // false
     defaultBranchName: string; // "main" (git init)
+  };
+  /** Docker view (docs/GUIDE.md §15.3.D). */
+  docker: {
+    enabled: boolean; // true: show Docker view and detect docker on the VM
+    command: "docker" | "sudo docker" | "podman"; // CLI used on the VM ("sudo docker" = `sudo -n docker`)
+    logTail: number; // 500: initial lines of a container log
+    logTimestamps: boolean; // false: `--timestamps`
+    showStoppedContainers: boolean; // true: `docker ps -a`
+    confirmDestructive: boolean; // true: confirm remove / kill / prune
+    statsIntervalHint: number; // 2: seconds between stats samples kept by the UI (1-10)
   };
 }
 

@@ -28,15 +28,19 @@
   import SquareTerminalIcon from "@lucide/svelte/icons/square-terminal";
   import SearchIcon from "@lucide/svelte/icons/search";
   import GitBranchIcon from "@lucide/svelte/icons/git-branch";
+  import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
+  import ContainerIcon from "@lucide/svelte/icons/container";
+  import SyncSettingsSection from "./sync/SyncSettingsSection.svelte";
+  import SyncDialogs from "./sync/SyncDialogs.svelte";
 
-  type SectionId = "appearance" | "editor" | "files" | "terminal" | "connection" | "git";
+  type SectionId = "appearance" | "editor" | "files" | "terminal" | "connection" | "git" | "docker" | "sync";
 
   const SECTIONS: { id: SectionId; label: string; icon: typeof PaletteIcon; rows: string[] }[] = [
     {
       id: "appearance",
       label: "Appearance",
       icon: PaletteIcon,
-      rows: ["Color Theme", "Accent Color", "UI Density", "Corner Radius", "Terminal Accent", "Reset Theme Customization"],
+      rows: ["Color Theme", "Accent Color", "UI Density", "Corner Radius", "Terminal Accent", "Motion", "Reset Theme Customization"],
     },
     {
       id: "editor",
@@ -106,10 +110,32 @@
         "Default Branch Name",
       ],
     },
+    {
+      id: "docker",
+      label: "Docker",
+      icon: ContainerIcon,
+      rows: [
+        "Enable Docker",
+        "Docker Command",
+        "Log Tail Lines",
+        "Log Timestamps",
+        "Show Stopped Containers",
+        "Confirm Destructive Actions",
+        "Stats Sample Interval",
+      ],
+    },
+    {
+      id: "sync",
+      label: "Sync",
+      icon: RefreshCwIcon,
+      rows: ["Export Settings", "Import Settings", "Undo Last Import", "Settings Sync"],
+    },
   ];
 
   // Git section (§14.4.G1): one row per `settings.git` field.
   const GIT_SECTION = SECTIONS.find((s) => s.id === "git")!;
+  const SYNC_SECTION = SECTIONS.find((s) => s.id === "sync")!;
+  const DOCKER_SECTION = SECTIONS.find((s) => s.id === "docker")!;
   type GitBool = {
     [K in keyof typeof settings.git]: (typeof settings.git)[K] extends boolean ? K : never;
   }[keyof typeof settings.git];
@@ -154,6 +180,11 @@
   }
 
   // Appearance (docs/GUIDE.md §14.4.Z).
+  const MOTIONS: { id: "full" | "reduced" | "off"; label: string }[] = [
+    { id: "full", label: "Full" },
+    { id: "reduced", label: "Reduced" },
+    { id: "off", label: "Off" },
+  ];
   const themeAccent = $derived(THEMES[settings.theme]?.accent ?? "#61afef");
   const accentCustom = $derived(
     settings.appearance.accent !== null && !ACCENT_PRESETS.some((p) => p.color === settings.appearance.accent),
@@ -385,6 +416,26 @@
                   <div class="text-[11px] text-muted-foreground">Use the accent color for the terminal cursor and selection.</div>
                 </div>
                 <Switch bind:checked={settings.appearance.terminalAccent} />
+              </div>
+            {/if}
+
+            {#if rowVisible("Motion")}
+              <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Motion</div>
+                  <div class="text-[11px] text-muted-foreground">Quick transitions and the theme-switch animation. Reduced is fades only; Full follows the OS "reduce motion" setting.</div>
+                </div>
+                <ToggleGroup
+                  type="single"
+                  size="sm"
+                  value={settings.appearance.motion}
+                  onValueChange={(v) => v && (settings.appearance.motion = v as typeof settings.appearance.motion)}
+                  data-testid="motion-setting"
+                >
+                  {#each MOTIONS as m (m.id)}
+                    <ToggleGroupItem value={m.id} class="px-2.5 text-[11px]" data-testid={`motion-${m.id}`}>{m.label}</ToggleGroupItem>
+                  {/each}
+                </ToggleGroup>
               </div>
             {/if}
 
@@ -931,6 +982,115 @@
           </section>
         {/if}
 
+        <!-- Docker (§15.3.D) ----------------------------------------------- -->
+        {#if sectionVisible(DOCKER_SECTION)}
+          <section class="pb-4" data-testid="settings-docker">
+            {#if q === ""}<h3 class="pb-2 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">Docker</h3>{/if}
+            {#if rowVisible("Enable Docker")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Enable Docker</div>
+                  <div class="text-[11px] text-muted-foreground">Show the Docker view and detect docker or podman on the VM.</div>
+                </div>
+                <Switch bind:checked={settings.docker.enabled} data-testid="settings-docker-enabled" />
+              </div>
+            {/if}
+            {#if rowVisible("Docker Command")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Docker Command</div>
+                  <div class="text-[11px] text-muted-foreground">How docker is run on the VM. "sudo docker" runs <span class="font-mono">sudo -n docker</span> (needs passwordless sudo).</div>
+                </div>
+                <select
+                  class="h-7 rounded-md border border-input bg-transparent px-2 text-[12px] outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+                  bind:value={settings.docker.command}
+                  data-testid="settings-docker-command"
+                >
+                  <option value="docker">docker</option>
+                  <option value="sudo docker">sudo docker</option>
+                  <option value="podman">podman</option>
+                </select>
+              </div>
+            {/if}
+            {#if rowVisible("Log Tail Lines")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Log Tail Lines</div>
+                  <div class="text-[11px] text-muted-foreground">Lines of history loaded when a container log opens.</div>
+                </div>
+                <Input
+                  type="number"
+                  min="0"
+                  step="50"
+                  class="h-7 w-24 text-[12px]"
+                  value={settings.docker.logTail}
+                  data-testid="settings-docker-tail"
+                  oninput={(e) => {
+                    const n = Number((e.currentTarget as HTMLInputElement).value);
+                    if (Number.isFinite(n) && n >= 0) settings.docker.logTail = Math.min(100000, Math.floor(n));
+                  }}
+                />
+              </div>
+            {/if}
+            {#if rowVisible("Log Timestamps")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Log Timestamps</div>
+                  <div class="text-[11px] text-muted-foreground">Prefix each log line with its time (docker logs --timestamps).</div>
+                </div>
+                <Switch bind:checked={settings.docker.logTimestamps} />
+              </div>
+            {/if}
+            {#if rowVisible("Show Stopped Containers")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Show Stopped Containers</div>
+                  <div class="text-[11px] text-muted-foreground">List exited and created containers in the sidebar.</div>
+                </div>
+                <Switch bind:checked={settings.docker.showStoppedContainers} />
+              </div>
+            {/if}
+            {#if rowVisible("Confirm Destructive Actions")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Confirm Destructive Actions</div>
+                  <div class="text-[11px] text-muted-foreground">Ask before removing, killing or pruning.</div>
+                </div>
+                <Switch bind:checked={settings.docker.confirmDestructive} />
+              </div>
+            {/if}
+            {#if rowVisible("Stats Sample Interval")}
+              <div class="flex items-center justify-between gap-4 py-2.5">
+                <div>
+                  <div class="text-[13px] font-medium">Stats Sample Interval</div>
+                  <div class="text-[11px] text-muted-foreground">Seconds between samples kept in the Stats charts (1 to 10). Docker itself reports about once a second.</div>
+                </div>
+                <Input
+                  type="number"
+                  min="1"
+                  max="10"
+                  step="1"
+                  class="h-7 w-24 text-[12px]"
+                  value={settings.docker.statsIntervalHint}
+                  data-testid="settings-docker-stats"
+                  oninput={(e) => {
+                    const n = Number((e.currentTarget as HTMLInputElement).value);
+                    if (Number.isFinite(n) && n >= 1 && n <= 10) settings.docker.statsIntervalHint = Math.floor(n);
+                  }}
+                />
+              </div>
+            {/if}
+          </section>
+        {/if}
+
+        <!-- Sync (§15.3.Y) ------------------------------------------------ -->
+        {#if sectionVisible(SYNC_SECTION)}
+          <section class="pb-4">
+            {#if q === ""}<h3 class="pb-2 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">Sync</h3>{/if}
+            <SyncSettingsSection />
+          </section>
+        {/if}
+
       </div>
     </div>
 
@@ -939,3 +1099,5 @@
     </Dialog.Footer>
   </Dialog.Content>
 </Dialog.Root>
+
+<SyncDialogs />

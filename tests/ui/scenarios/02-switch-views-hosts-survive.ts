@@ -10,7 +10,7 @@ export const scenario: Scenario = {
   async run({ page }) {
     await waitFor(async () => (await hostRowCount(page)) === 3, "3 host rows on initial load");
 
-    await page.getByRole("button", { name: "Explorer" }).click();
+    await page.getByRole("button", { name: "Explorer", exact: true }).click();
     await page.getByRole("button", { name: "Commands" }).click();
     await page.getByRole("button", { name: "Hosts" }).click();
 

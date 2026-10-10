@@ -241,7 +241,7 @@ export function onForwardState(handler: (payload: ForwardStateEvent) => void): P
 
 // --- Persistence (§11.1) -------------------------------------------------
 
-export type StoreName = "settings" | "profiles" | "history" | "paused" | "forwards" | "logs";
+export type StoreName = "settings" | "profiles" | "history" | "paused" | "forwards" | "logs" | "workspaces";
 
 /** Reads `<app_data_dir>/<name>.json`. `null` if missing or corrupt. */
 export function loadStore<T>(name: StoreName): Promise<T | null> {
@@ -498,4 +498,188 @@ export function fileInfo(sessionId: string, path: string): Promise<import("./typ
 /** On-demand folder size and file/folder counts (du/find over exec). */
 export function dirSize(sessionId: string, path: string): Promise<import("./types").DirSize> {
   return call<import("./types").DirSize>("dir_size", { sessionId, path });
+}
+
+// --- Window chrome (§15.3.T) -------------------------------------------------
+// The window is frameless (`decorations: false`); the custom title bar drives
+// the native window through these wrappers. All are no-ops that never throw
+// outside Tauri.
+
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+export function winMinimize(): Promise<void> {
+  return getCurrentWindow().minimize();
+}
+
+export function winToggleMaximize(): Promise<void> {
+  return getCurrentWindow().toggleMaximize();
+}
+
+/** Closes the current window (the detached terminal window turns this into a dock-back, §14.4.W). */
+export function winClose(): Promise<void> {
+  return getCurrentWindow().close();
+}
+
+export function winIsMaximized(): Promise<boolean> {
+  return getCurrentWindow().isMaximized();
+}
+
+/** Fires whenever the window is resized (including maximize / restore). */
+export function onWinResized(handler: () => void): Promise<UnlistenFn> {
+  return getCurrentWindow().onResized(() => handler());
+}
+
+/** Native window title (taskbar / Alt+Tab). */
+export function winSetTitle(title: string): Promise<void> {
+  return getCurrentWindow().setTitle(title);
+}
+
+/** Application version from tauri.conf.json (About dialog). */
+export async function appVersion(): Promise<string> {
+  const { getVersion } = await import("@tauri-apps/api/app");
+  return getVersion();
+}
+
+// --- Docker (§15.3.D) -----------------------------------------------------------
+
+export interface DockerOutput {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+}
+
+export interface DockerLogsOpts {
+  follow?: boolean;
+  tail?: number;
+  timestamps?: boolean;
+  since?: string;
+  /** `target` is a compose project name (`docker compose -p <name> logs`). */
+  compose?: boolean;
+  /** The `docker.command` setting ("docker" | "sudo docker" | "podman"). */
+  command?: string;
+}
+
+/** Runs `docker <args…>` on the VM. A non-zero exit does not throw; check `code`. */
+export function dockerRun(sessionId: string, args: string[], stdin?: string, command?: string): Promise<DockerOutput> {
+  return call<DockerOutput>("docker_run", { sessionId, args, stdin: stdin ?? null, command: command ?? null });
+}
+
+export function dockerLogsStart(sessionId: string, target: string, opts: DockerLogsOpts = {}): Promise<string> {
+  return call<string>("docker_logs_start", { sessionId, target, opts });
+}
+
+export function dockerLogsStop(streamId: string): Promise<void> {
+  return call<void>("docker_logs_stop", { streamId });
+}
+
+export function dockerStatsStart(sessionId: string, containers?: string[], command?: string): Promise<string> {
+  return call<string>("docker_stats_start", { sessionId, containers: containers ?? null, command: command ?? null });
+}
+
+export function dockerStatsStop(streamId: string): Promise<void> {
+  return call<void>("docker_stats_stop", { streamId });
+}
+
+export function dockerEventsStart(sessionId: string, command?: string): Promise<string> {
+  return call<string>("docker_events_start", { sessionId, command: command ?? null });
+}
+
+export function dockerEventsStop(streamId: string): Promise<void> {
+  return call<void>("docker_events_stop", { streamId });
+}
+
+export interface DockerLogChunk {
+  streamId: string;
+  chunk: string;
+  stream: "stdout" | "stderr";
+}
+export interface DockerLinesEvent {
+  streamId: string;
+  lines: string[];
+}
+export interface DockerEndEvent {
+  streamId: string;
+  code: number | null;
+}
+
+export function onDockerLogs(handler: (p: DockerLogChunk) => void): Promise<UnlistenFn> {
+  return listen<DockerLogChunk>("docker://logs", (e) => handler(e.payload));
+}
+export function onDockerLogsEnd(handler: (p: DockerEndEvent) => void): Promise<UnlistenFn> {
+  return listen<DockerEndEvent>("docker://logs-end", (e) => handler(e.payload));
+}
+export function onDockerStats(handler: (p: DockerLinesEvent) => void): Promise<UnlistenFn> {
+  return listen<DockerLinesEvent>("docker://stats", (e) => handler(e.payload));
+}
+export function onDockerStatsEnd(handler: (p: DockerEndEvent) => void): Promise<UnlistenFn> {
+  return listen<DockerEndEvent>("docker://stats-end", (e) => handler(e.payload));
+}
+export function onDockerEvents(handler: (p: DockerLinesEvent) => void): Promise<UnlistenFn> {
+  return listen<DockerLinesEvent>("docker://events", (e) => handler(e.payload));
+}
+export function onDockerEventsEnd(handler: (p: DockerEndEvent) => void): Promise<UnlistenFn> {
+  return listen<DockerEndEvent>("docker://events-end", (e) => handler(e.payload));
+}
+
+// --- Settings sync (§15.3.Y) ------------------------------------------------------
+
+/** Native save dialog + write of an `overssh-settings` bundle. Resolves to the path, or null if cancelled. */
+export function localWriteText(suggestedName: string, text: string): Promise<string | null> {
+  return call<string | null>("local_write_text", { suggestedName, text });
+}
+
+/** Native open dialog + read (.json / .oversshsettings, max 5 MB). Resolves to null if cancelled. */
+export function localReadText(): Promise<{ path: string; text: string } | null> {
+  return call<{ path: string; text: string } | null>("local_read_text");
+}
+
+// --- systemd services (§15.3.V) ------------------------------------------------
+
+import type * as Sd from "./systemd/types";
+
+export function systemdProbe(sessionId: string): Promise<Sd.SystemdProbe> {
+  return call<Sd.SystemdProbe>("systemd_probe", { sessionId });
+}
+
+export function systemdList(sessionId: string, user: boolean): Promise<Sd.SystemdList> {
+  return call<Sd.SystemdList>("systemd_list", { sessionId, user });
+}
+
+export function systemdTimers(sessionId: string, user: boolean): Promise<Sd.SystemdTimer[]> {
+  return call<Sd.SystemdTimer[]>("systemd_timers", { sessionId, user });
+}
+
+/** Names of failed service units (cheap; drives the tab badge). */
+export function systemdFailed(sessionId: string, user: boolean): Promise<string[]> {
+  return call<string[]>("systemd_failed", { sessionId, user });
+}
+
+export function systemdShow(sessionId: string, user: boolean, unit: string): Promise<Sd.SystemdProp[]> {
+  return call<Sd.SystemdProp[]>("systemd_show", { sessionId, user, unit });
+}
+
+export function systemdStats(sessionId: string, user: boolean, units: string[]): Promise<Sd.SystemdStat[]> {
+  return call<Sd.SystemdStat[]>("systemd_stats", { sessionId, user, units });
+}
+
+export function systemdText(
+  sessionId: string,
+  user: boolean,
+  kind: Sd.SystemdTextKind,
+  unit: string,
+): Promise<Sd.SystemdText> {
+  return call<Sd.SystemdText>("systemd_text", { sessionId, user, kind, unit });
+}
+
+/** start/stop/enable/…; runs through `sudo -n` when not root. Never throws for a failed
+ * command: check `ok` / `error` (`sudoPassword` = sudo needs a password). */
+export function systemdAction(
+  sessionId: string,
+  user: boolean,
+  action: Sd.SystemdAction,
+  unit?: string,
+  now?: boolean,
+): Promise<Sd.SystemdActionResult> {
+  return call<Sd.SystemdActionResult>("systemd_action", { sessionId, user, action, unit: unit ?? null, now: now ?? null });
 }

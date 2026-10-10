@@ -23,7 +23,10 @@ mockWindows("main");
 
 // --- fake git (§14): handler chain, one entry per agent -------------------------------
 import { gitFake, gitHandlerG2, type GitHandler } from "./fakeGitG2";
-import { g1GitRun, g1Patch, g1Snapshot, gitCalls as g1GitCalls, setGitMissing as g1SetGitMissing } from "./mockGit";
+import { syncCommand } from "./mockSync"; // §15.3.Y settings sync (window.__sync)
+import { systemdCommand } from "./mockSystemd"; // §15.3.V systemd services (window.__systemd)
+import { dockerFake, dockerRun, eventsStart as dockerEventsStart, logsStart as dockerLogsStart, pushLog as dockerPushLog, resetDocker, statsStart as dockerStatsStart, streamStop as dockerStreamStop } from "./mockDocker"; // §15.3.D docker
+import { g1GitDirList, g1GitRun, g1Patch, g1Snapshot, gitCalls as g1GitCalls, setGitMissing as g1SetGitMissing } from "./mockGit";
 // G2's handler answers only while `gitFake.active`; G1's (tests/ui/mockGit.ts) is the Source Control fake.
 const gitHandlers: GitHandler[] = [gitHandlerG2, (req) => g1GitRun(req.repo, req.args, req.stdin ?? undefined)];
 
@@ -192,6 +195,7 @@ function notFound(path: string): never {
 let cronText = ["MAILTO=ops@example.com", "# nightly backup", "30 2 * * 1 /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1", "#*/10 * * * * /opt/old-job.sh", ""].join(String.fromCharCode(10));
 const cronWrites: string[] = [];
 const termWriteLog: { termId: string; data: string }[] = [];
+const termResizeLog: { termId: string; cols: number; rows: number }[] = [];
 let duCounter = 0;
 const duRequests: { path: string; depth: number }[] = [];
 const cancelledDu = new Set<string>();
@@ -327,6 +331,7 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
   ) {
     throw { kind: "Connection", message: "no such session" };
   }
+  if (cmd.startsWith("systemd_")) return systemdCommand(cmd, args);
   switch (cmd) {
     case "list_hosts":
       return [...FAKE_HOSTS, ...(window.__HARNESS_EXTRA_HOSTS__ ?? [])];
@@ -365,6 +370,8 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
 
     case "list_dir": {
       const path = args.path as string;
+      const gitDir = g1GitDirList(path);
+      if (gitDir) return gitDir.map((e) => ({ ...e, size: 0, mtime: 0, permissions: e.kind === "dir" ? 0o40755 : 0o100644, isHidden: false }));
       const entries = tree[path];
       if (!entries) notFound(path);
       return entries.map((e) => ({ ...e }));
@@ -518,6 +525,8 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
       return null;
 
     case "term_resize":
+      termResizeLog.push({ termId: args.termId as string, cols: args.cols as number, rows: args.rows as number });
+      return null;
     case "term_close":
       return null;
 
@@ -743,6 +752,25 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
       return { code: 128, stdout: "", stderr: `fatal: fake git does not know: ${req.args.join(" ")}`, truncated: false };
     }
 
+    case "local_write_text":
+    case "local_read_text":
+      return syncCommand(cmd, args);
+
+    // §15.3.D docker: fake CLI and streams (tests/ui/mockDocker.ts)
+    case "docker_run":
+      return dockerRun(args.args as string[], (args.command as string | null) ?? null, (args.stdin as string | null) ?? null);
+    case "docker_logs_start":
+      return dockerLogsStart(args.sessionId as string, args.target as string, (args.opts as Record<string, unknown>) ?? {});
+    case "docker_stats_start":
+      return dockerStatsStart();
+    case "docker_events_start":
+      return dockerEventsStart();
+    case "docker_logs_stop":
+    case "docker_stats_stop":
+    case "docker_events_stop":
+      dockerStreamStop(args.streamId as string);
+      return null;
+
     case "load_store":
       return stores.get(args.name as string) ?? null;
 
@@ -752,9 +780,26 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
 
     default:
       if (cmd.startsWith("plugin:dialog|")) return dialogResult; // null = open/save cancelled
+      // Window chrome (§15.3.T): minimize / maximize / close / title are only recorded.
+      if (cmd.startsWith("plugin:window|")) return windowCommand(cmd.slice("plugin:window|".length), args);
+      if (cmd === "plugin:app|version") return "0.1.0";
       console.warn(`[harness] unhandled command: ${cmd}`, args);
       return null;
   }
+}
+
+const windowCalls: { cmd: string; args: Record<string, unknown> }[] = [];
+let windowMaximized = false;
+let windowTitle = "";
+function windowCommand(name: string, args: Record<string, unknown>): unknown {
+  if (name === "is_maximized") return windowMaximized;
+  if (name === "set_title") windowTitle = String(args.value ?? "");
+  windowCalls.push({ cmd: name, args });
+  if (name === "toggle_maximize" || name === "internal_toggle_maximize") windowMaximized = !windowMaximized;
+  else if (name === "maximize") windowMaximized = true;
+  else if (name === "unmaximize") windowMaximized = false;
+  if (/maximize/.test(name)) void emit("tauri://resize", { width: 1280, height: 800 });
+  return null;
 }
 
 mockIPC((cmd, args) => handle(cmd, (args ?? {}) as Record<string, unknown>), {
@@ -765,7 +810,7 @@ const recLog: { cmd: string; args: Record<string, unknown> }[] = [];
 const termWindowCalls: { cmd: string; args: Record<string, unknown> }[] = [];
 let termWindowOpen = false;
 const termwinLog: { name: string; payload: unknown }[] = [];
-for (const name of ["init", "ctx", "settings", "remap", "open", "reopen", "activate", "close-requested"]) {
+for (const name of ["init", "ctx", "settings", "remap", "open", "reopen", "activate", "close-requested", "split", "ready", "tabs", "dock", "opened"]) {
   void listen("termwin://" + name, (e) => termwinLog.push({ name, payload: e.payload }));
 }
 
@@ -814,6 +859,11 @@ declare global {
       termWindowCalls: () => { cmd: string; args: Record<string, unknown> }[];
       /** Every `termwin://*` message the main window emitted, in order (§14.4.W). */
       termwinEvents: () => { name: string; payload: unknown }[];
+      /** Window commands (`plugin:window|*`: minimize, toggle_maximize, close, ...) the title bar sent (§15.3.T). */
+      windowCalls: () => { cmd: string; args: Record<string, unknown> }[];
+      windowTitle: () => string;
+      /** Set the fake window's maximized state (and fire a resize event). */
+      setMaximized: (v: boolean) => Promise<void>;
       /** rec_* commands the app sent (§13.4.T2). */
       recCalls: () => { cmd: string; args: Record<string, unknown> }[];
       /** `transfer_start` specs, in order (§13.4.S). */
@@ -857,6 +907,12 @@ window.__harness = {
   fileExists: (path) => findEntry(path) !== null,
   fileContent: (path) => fileContents[path] ?? null,
   writes: () => writeLog.map((w) => ({ ...w })),
+  windowCalls: () => windowCalls.map((c) => ({ cmd: c.cmd, args: { ...c.args } })),
+  windowTitle: () => windowTitle,
+  setMaximized: (v) => {
+    windowMaximized = v;
+    return emit("tauri://resize", { width: 1280, height: 800 });
+  },
   recCalls: () => recLog.map((c) => ({ ...c })),
   termWindowCalls: () => termWindowCalls.map((c) => ({ ...c })),
   termwinEvents: () => termwinLog.map((e) => ({ ...e })),
@@ -878,11 +934,21 @@ window.__harness = {
   },
   duRequests: () => duRequests.map((r) => ({ ...r })),
   termWrites: () => termWriteLog.map((w) => ({ ...w })),
+  /** Every term_resize the app sent (xterm fit), in order (§15.3.S). */
+  termResizes: () => termResizeLog.map((r) => ({ ...r })),
   // §14.4.G1 fake git (tests/ui/mockGit.ts)
   g1GitCalls: () => g1GitCalls.map((c) => ({ ...c, args: [...c.args] })),
   g1GitSnapshot: (root) => g1Snapshot(root),
   g1GitMissing: (missing) => g1SetGitMissing(missing),
   g1GitPatch: (root, patch) => g1Patch(root, patch),
+  // §15.3.D fake docker (tests/ui/mockDocker.ts)
+  dockerCalls: () => dockerFake.calls.map((c) => ({ ...c, args: [...c.args] })),
+  dockerFakeSet: (patch: Record<string, unknown>) => Object.assign(dockerFake, patch),
+  dockerLogStreams: () => dockerFake.logStreams.map((s) => ({ ...s })),
+  dockerStreams: () => ({ stats: dockerFake.statsRunning, events: dockerFake.eventsRunning }),
+  dockerPushLog: (target: string, text: string) => dockerPushLog(target, text),
+  dockerReset: () => resetDocker(),
+  dockerState: () => dockerFake.containers.map((c) => ({ name: c.name, state: c.state })),
   // §14.4.G2 fake git (tests/ui/fakeGitG2.ts)
   gitCalls: () => gitFake.calls.map((c) => [...c.args]),
   gitFakeSet: (patch: { active?: boolean; mode?: "small" | "big"; dirty?: string[]; failNext?: string | null }) => Object.assign(gitFake, patch),

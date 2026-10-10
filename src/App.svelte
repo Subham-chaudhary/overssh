@@ -2,8 +2,8 @@
   import { onMount, onDestroy } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { app } from "./lib/stores.svelte";
-  import { onSessionClosed } from "./lib/api";
-  import { settings, DEFAULTS } from "./lib/settings.svelte";
+  import { isAppError, onSessionClosed } from "./lib/api";
+  import { settings, DEFAULTS, appliedTheme } from "./lib/settings.svelte";
   import { refreshMonacoThemes } from "./lib/monaco";
   import { openThemePicker, themePicker } from "./lib/themepicker.svelte";
   import { THEMES } from "./lib/themes";
@@ -13,6 +13,7 @@
   import { tabSwitcher } from "./lib/tabswitch.svelte";
   import TabSwitcher from "./components/TabSwitcher.svelte";
   import ThemePicker from "./components/ThemePicker.svelte";
+  import ProfilesHost from "./components/profiles/ProfilesHost.svelte";
   import HostList from "./components/HostList.svelte";
   import Explorer from "./components/Explorer.svelte";
   import CommandHistory from "./components/CommandHistory.svelte";
@@ -27,6 +28,7 @@
   import DetachedBar from "./terminal-window/DetachedBar.svelte";
   import WorkspaceSwitcher from "./components/WorkspaceSwitcher.svelte";
   import Logo from "./components/Logo.svelte";
+  import TitleBar from "./components/chrome/TitleBar.svelte";
   import { Toaster } from "$lib/components/ui/sonner/index.js";
   import * as Tooltip from "$lib/components/ui/tooltip/index.js";
   import { Kbd } from "$lib/components/ui/kbd/index.js";
@@ -42,6 +44,11 @@
   import GitBranchIcon from "@lucide/svelte/icons/git-branch";
   import ScmView from "./components/git/ScmView.svelte";
   import GitView from "./components/git/GitView.svelte";
+  import ContainerIcon from "@lucide/svelte/icons/container";
+  import DockerSidebar from "./components/docker/DockerSidebar.svelte";
+  import DockerView from "./components/docker/DockerView.svelte";
+  import { registerDockerCommands } from "./lib/docker/commands";
+  import { showDocker } from "./lib/docker/docker.svelte";
   import { registerGitCommands, showSourceControl } from "./lib/git/commands";
   import { searchStore } from "$lib/search.svelte";
   import MonitorSidebar from "./components/monitor/MonitorSidebar.svelte";
@@ -83,13 +90,15 @@
     { id: "monitor", label: "Dashboard", icon: ActivityIcon },
     { id: "logs", label: "Logs", icon: ScrollTextIcon },
     { id: "ports", label: "Ports", icon: CableIcon },
+    { id: "docker", label: "Docker", icon: ContainerIcon },
   ];
 
   /** The main area shows the Dashboard / Logs page while that view is the
    * visible sidebar view (or the last one, when the sidebar is hidden). */
-  const mainPage = $derived.by((): "editor" | "monitor" | "logs" | "git" => {
+  const mainPage = $derived.by((): "editor" | "monitor" | "logs" | "git" | "docker" => {
     const v = app.sidebarView ?? lastSidebarView;
     if (v === "scm") return "git";
+    if (v === "docker") return "docker";
     return v === "monitor" || v === "logs" ? v : "editor";
   });
 
@@ -99,9 +108,11 @@
   }
 
   onMount(() => {
-    void onSessionClosed((payload) => app.handleSessionClosed(payload)).then((fn) => {
-      unlisten = fn;
-    });
+    void onSessionClosed((payload) => app.handleSessionClosed(payload))
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((err) => console.error("session://closed listener failed", err));
 
     // Core command-palette entries. src/lib/commands.svelte.ts's registry lets
     // other modules (editor, terminal) add more later without touching this file.
@@ -291,10 +302,12 @@
     ];
 
     const offGit = registerGitCommands(); // §14.4.G1: Git palette commands + repo detection
+    const offDocker = registerDockerCommands(); // §15.3.D: Docker palette commands + stream wiring
 
     return () => {
       for (const off of unregisterFns) off();
       offGit();
+      offDocker();
     };
   });
 
@@ -304,8 +317,8 @@
 
   // Accent colour changes re-define the Monaco themes (no-op until Monaco loaded).
   $effect(() => {
-    void settings.appearance.accent;
-    void settings.theme;
+    void appliedTheme.accent;
+    void appliedTheme.id;
     void settings.editor.themeOverride;
     refreshMonacoThemes();
   });
@@ -429,7 +442,7 @@
     if (!app.showTerminal) {
       app.showTerminal = true;
       if (!terminalStore.focusActive() && app.activeSessionId) {
-        await terminalStore.openNew(app.activeSessionId, { cwd: app.activeExplorer?.cwd });
+        await newTerminal();
       }
     } else if (terminalStore.hasFocus()) {
       focusActiveEditor();
@@ -446,7 +459,21 @@
       app.addToast("info", "Connect to a host first");
       return;
     }
-    await terminalStore.openNew(sid, { cwd: app.activeExplorer?.cwd });
+    try {
+      await terminalStore.openNew(sid, { cwd: app.activeExplorer?.cwd });
+    } catch (err) {
+      app.addToast("error", isAppError(err) ? err.message : String(err));
+    }
+  }
+
+  /** Focus is inside an open modal (input / confirm / settings / palette dialog). */
+  function isInsideDialog(target: EventTarget | null): boolean {
+    // Monaco's find widget is not a modal: editor shortcuts keep working there.
+    return (
+      target instanceof Element &&
+      target.closest('[role="dialog"],[role="alertdialog"]') !== null &&
+      !isInsideMonaco(target)
+    );
   }
 
   /** Keys while the Ctrl+Tab switcher is open: Tab/arrows move, Enter commits,
@@ -492,6 +519,15 @@
       return;
     }
     if (themePicker.open) return; // ThemePicker.svelte owns the keyboard while open
+    // A modal owns the keyboard: app shortcuts must not act on the workbench
+    // behind it (Ctrl+W closing a tab under a rename prompt, ...). Browser
+    // defaults are still blocked.
+    if (app.dialogRequest || app.pendingConnect || isInsideDialog(e.target)) {
+      if (e.key === "F5" || e.key === "F7" || (mod && (key === "r" || key === "p" || key === "u" || key === "o" || key === "s" || key === "n" || key === "h"))) {
+        e.preventDefault();
+      }
+      return;
+    }
 
     // --- app shortcuts ---
     // Ctrl+W / Ctrl+T / Ctrl+Shift+T: terminal tabs when focus is in an xterm,
@@ -553,6 +589,11 @@
     if (mod && e.shiftKey && !e.altKey && key === "g") {
       e.preventDefault(); // Ctrl+Shift+G: Source Control (Ctrl+G stays "go to line" / find)
       showSourceControl();
+      return;
+    }
+    if (mod && e.shiftKey && !e.altKey && key === "d") {
+      e.preventDefault(); // Ctrl+Shift+D: Docker (browser "bookmark all tabs" is blocked)
+      showDocker();
       return;
     }
     if (mod && key === "tab") {
@@ -650,14 +691,18 @@
 
 <Tooltip.Provider>
   <div class="flex h-full flex-col">
+    <TitleBar />
     <div class="flex min-h-0 flex-1">
-      <nav class="flex w-11 flex-none flex-col gap-0.5 border-r border-border bg-sidebar py-1.5" aria-label="Views">
+      <nav class="relative flex w-11 flex-none flex-col gap-0.5 border-r border-border bg-sidebar py-1.5" aria-label="Views">
+        <!-- One active marker that slides between the icons (each row is 2rem + 0.125rem gap). -->
+        <span
+          class="pointer-events-none absolute left-0 top-[calc(0.375rem+0.25rem)] h-[calc(2rem-0.5rem)] w-0.5 rounded-r bg-primary"
+          style={`transform:translateY(calc(${Math.max(0, VIEWS.findIndex((x) => x.id === (app.sidebarView ?? lastSidebarView)))} * 2.125rem));opacity:${app.sidebarView === null ? 0 : 1};transition:transform var(--motion-base) var(--motion-ease),opacity var(--motion-fast) var(--motion-ease)`}
+          data-testid="activity-indicator"
+          aria-hidden="true"
+        ></span>
         {#each VIEWS as v (v.id)}
           <div class="relative flex justify-center">
-            <span
-              class={`absolute left-0 top-1 bottom-1 w-0.5 rounded-r bg-primary transition-opacity ${app.sidebarView === v.id ? "opacity-100" : "opacity-0"}`}
-              aria-hidden="true"
-            ></span>
             <Tooltip.Root>
               <Tooltip.Trigger>
                 {#snippet child({ props })}
@@ -699,7 +744,8 @@
 
       {#if app.sidebarView !== null}
         <aside class="@container/side flex min-w-0 flex-none flex-col overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground" style={`width:${sidebarPx}px`}>
-          <div class="flex min-h-0 flex-1 flex-col">
+          {#key app.sidebarView}
+          <div class="motion-fade flex min-h-0 flex-1 flex-col">
             {#if app.sidebarView === "hosts"}
               <HostList />
             {:else if app.sidebarView === "explorer"}
@@ -714,10 +760,13 @@
               <PortsView />
             {:else if app.sidebarView === "scm"}
               <ScmView />
+            {:else if app.sidebarView === "docker"}
+              <DockerSidebar />
             {:else if app.sidebarView === "search"}
               <SearchView />
             {/if}
           </div>
+          {/key}
         </aside>
 
         <div
@@ -748,14 +797,18 @@
             <!-- Main-area page (docs/GUIDE.md §13.1): the Dashboard and Logs
                  views take over the editor area while their view is the
                  current/last sidebar view; every other view shows the editor. -->
+            {#key mainPage}
+            <div class="motion-fade h-full min-h-0 min-w-0">
             {#if mainPage === "monitor"}
               <MonitorView />
             {:else if mainPage === "git"}
               <GitView />
+            {:else if mainPage === "docker"}
+              <DockerView />
             {:else if mainPage === "logs"}
               <LogView />
             {:else if (app.activeWorkspace?.tabs.length ?? 0) === 0}
-              <div class="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
+              <div class="motion-fade flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
                 <Logo size={96} />
                 <p class="text-base font-medium text-foreground">OverSSH</p>
                 <ul class="flex flex-col gap-1.5 text-[12px]">
@@ -779,6 +832,8 @@
             {:else}
               <EditorTabs />
             {/if}
+            </div>
+            {/key}
           </div>
         </div>
 
@@ -827,5 +882,6 @@
   <CommandPalette />
   <TabSwitcher />
   <ThemePicker />
+  <ProfilesHost />
 </Tooltip.Provider>
 <Toaster position="bottom-right" theme={THEMES[settings.theme]?.isDark ? "dark" : "light"} />

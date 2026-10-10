@@ -15,7 +15,7 @@ export const scenario: Scenario = {
 
     // A successful connect flips app.sidebarView to "explorer".
     await waitFor(
-      async () => (await page.getByRole("button", { name: "Explorer" }).getAttribute("aria-label")) !== null,
+      async () => (await page.getByRole("button", { name: "Explorer", exact: true }).getAttribute("aria-label")) !== null,
       "explorer button present",
     );
 
@@ -32,7 +32,7 @@ export const scenario: Scenario = {
     // The real regression: mount HostList a second time (Explorer -> Hosts
     // again) now that a profile exists — this is what triggers the duplicate
     // profile push in the old profiles.svelte.ts.
-    await page.getByRole("button", { name: "Explorer" }).click();
+    await page.getByRole("button", { name: "Explorer", exact: true }).click();
     await page.getByRole("button", { name: "Hosts" }).click();
 
     await waitFor(
