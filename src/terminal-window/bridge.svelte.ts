@@ -20,6 +20,7 @@ import { reconnect } from "../lib/reconnect.svelte";
 import { registerCommand } from "../lib/commands.svelte";
 import { record } from "../lib/history.svelte";
 import { terminalStore, type TabState, type TermContext } from "../lib/terminal.svelte";
+import { termLayout } from "./layout.svelte";
 import type { Settings } from "../lib/types";
 
 export const EV = {
@@ -31,6 +32,7 @@ export const EV = {
   open: "termwin://open",
   reopen: "termwin://reopen",
   activate: "termwin://activate",
+  split: "termwin://split",
   // Rust (or main) -> terminal window: "dock your tabs back and close"
   closeRequested: "termwin://close-requested",
   // terminal window -> main
@@ -100,6 +102,8 @@ const openWaiters = new Map<
   { resolve: (id: string) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
 >();
 let reqCounter = 0;
+/** Bumps on every detach, so a stale dock fallback timer never closes a newer window. */
+let detachGeneration = 0;
 
 /** What the terminal window needs to know about the main window's sessions. */
 function buildCtx(): TermContext {
@@ -123,6 +127,7 @@ function onReady(): void {
   const st = terminalStore.snapshotState();
   const payload: InitPayload = { ...st, ctx: buildCtx(), settings: $state.snapshot(settings) as Settings };
   void api.emitEvent(EV.init, payload);
+  if (!terminalStore.detached) detachGeneration++;
   terminalStore.detached = true;
   app.showTerminal = false;
   readyResolve?.();
@@ -160,16 +165,23 @@ function finishDock(st: TabState): void {
   terminalStore.applyTabState(st);
   terminalStore.detached = false;
   app.showTerminal = st.tabs.length > 0;
+  // "New terminal" requests the window can no longer answer fail now, not after 30 s.
+  for (const [reqId, w] of openWaiters) {
+    openWaiters.delete(reqId);
+    clearTimeout(w.timer);
+    w.reject(new Error("The terminal window closed"));
+  }
   void api.termWindowClose().catch(() => undefined);
 }
 
 /** "Dock back" from the main window: ask the window for its final state. */
 async function dockPanel(): Promise<void> {
   if (!terminalStore.detached) return;
-  void api.emitEvent(EV.closeRequested);
+  const gen = detachGeneration;
+  void api.emitEvent(EV.closeRequested).catch(() => undefined);
   // Window not answering: fall back to the last mirrored tab list.
   setTimeout(() => {
-    if (terminalStore.detached) finishDock(terminalStore.snapshotState());
+    if (terminalStore.detached && gen === detachGeneration) finishDock(terminalStore.snapshotState());
   }, 3000);
 }
 
@@ -213,6 +225,10 @@ export function initMain(): void {
     activate: (id) => void api.emitEvent(EV.activate, { id }),
     remap: (oldId, newId) => void api.emitEvent(EV.remap, { oldId, newId }),
     focusWindow: () => void api.termWindowFocus().catch(() => undefined),
+    split: (dir) => {
+      void api.termWindowFocus().catch(() => undefined);
+      void api.emitEvent(EV.split, { dir });
+    },
   };
 
   mainListeners = Promise.all([
@@ -249,6 +265,25 @@ export function initMain(): void {
               run: () => void terminalStore.detach(),
             }),
       );
+    });
+    // Palette: split the detached window's terminal area (only while detached).
+    $effect(() => {
+      if (!terminalStore.detached) return;
+      const offs = [
+        registerCommand({
+          id: "terminal.splitRight",
+          title: "Terminal: Split Right (Terminals Window)",
+          category: "Terminal",
+          run: () => terminalStore.splitWindow("row"),
+        }),
+        registerCommand({
+          id: "terminal.splitDown",
+          title: "Terminal: Split Down (Terminals Window)",
+          category: "Terminal",
+          run: () => terminalStore.splitWindow("col"),
+        }),
+      ];
+      return () => offs.forEach((off) => off());
     });
     // Keep the window's view of sessions / explorer dirs / reconnects current.
     $effect(() => {
@@ -292,7 +327,11 @@ function adopt(p: InitPayload): void {
 export async function dockBack(): Promise<void> {
   if (windowState.docking) return;
   windowState.docking = true;
-  await api.emitEvent(EV.dock, terminalStore.snapshotState());
+  try {
+    await api.emitEvent(EV.dock, terminalStore.snapshotState());
+  } catch (err) {
+    console.error("dock message failed", err);
+  }
   // Main never closed us (it may be gone): close ourselves.
   setTimeout(() => void api.termWindowClose().catch(() => undefined), 4000);
 }
@@ -319,6 +358,7 @@ export async function initTerminalWindow(): Promise<void> {
     }),
     api.listenEvent<void>(EV.reopen, () => void terminalStore.reopenClosed()),
     api.listenEvent<{ id: string }>(EV.activate, (p) => terminalStore.setActive(p.id)),
+    api.listenEvent<{ dir: "row" | "col" }>(EV.split, (p) => void termLayout.split(p.dir === "col" ? "col" : "row")),
     api.listenEvent<void>(EV.closeRequested, () => void dockBack()),
   ]);
   await terminalStore.ensureListening();

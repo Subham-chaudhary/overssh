@@ -5,6 +5,7 @@
   import "@xterm/xterm/css/xterm.css";
   import * as api from "../lib/api";
   import { terminalStore } from "../lib/terminal.svelte";
+  import { app } from "../lib/stores.svelte";
   import { settings, terminalTheme } from "../lib/settings.svelte";
   import {
     loadHistory,
@@ -216,8 +217,52 @@
   export function fit(): void {
     if (!term || !fitAddon || !container) return;
     if (container.clientWidth === 0 || container.clientHeight === 0) return;
+    const dims = fitAddon.proposeDimensions();
+    // A collapsed / not yet laid out pane proposes 0 or NaN: keep the last size.
+    if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows) || dims.cols < 2 || dims.rows < 1) return;
     fitAddon.fit();
-    void api.termResize(termId, term.cols, term.rows);
+    if (isDead()) return;
+    api.termResize(termId, term.cols, term.rows).catch(() => {
+      /* the PTY is gone (exited / dropped): nothing to resize */
+    });
+  }
+
+  /** True once the PTY behind this tab has exited (or its link dropped). */
+  function isDead(): boolean {
+    return terminalStore.tabs.find((t) => t.id === termId)?.exited ?? true;
+  }
+
+  /** Writes to the PTY, ignoring a closed one (keys typed after exit / drop). */
+  function send(data: string): void {
+    if (isDead()) return;
+    api.termWrite(termId, data).catch(() => {
+      /* closed PTY: the exit / reconnect banner already tells the user */
+    });
+  }
+
+  /** Above this many characters a paste asks first (a huge paste floods the shell). */
+  const PASTE_CONFIRM_CHARS = 100_000;
+
+  async function pasteFromClipboard(): Promise<void> {
+    let text: string;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      app.addToast("error", "Clipboard access denied: cannot paste.");
+      return;
+    }
+    if (!text || !term) return;
+    if (text.length > PASTE_CONFIRM_CHARS) {
+      const lines = text.split("\n").length;
+      const ok = await app.ask({
+        title: "Paste a lot of text?",
+        message: `The clipboard holds ${text.length.toLocaleString()} characters (${lines.toLocaleString()} lines). Paste all of it into the terminal?`,
+        confirmLabel: "Paste",
+      });
+      if (!ok) return;
+    }
+    // term.paste honours bracketed-paste mode and goes through onData.
+    term?.paste(text);
   }
 
   function scheduleFit(): void {
@@ -252,7 +297,7 @@
         return;
       }
       processCapture(data);
-      void api.termWrite(termId, data);
+      send(data);
     });
 
     term.onWriteParsed(() => scheduleGhostUpdate());
@@ -283,7 +328,7 @@
         if (plain && (e.key === "ArrowRight" || e.key === "End")) {
           const suffix = ghostSuffix;
           hideGhost();
-          void api.termWrite(termId, suffix);
+          send(suffix);
           return false;
         }
         hideGhost();
@@ -312,7 +357,7 @@
       if (key === "c") {
         const selection = term?.getSelection();
         if (selection) {
-          void navigator.clipboard.writeText(selection);
+          navigator.clipboard.writeText(selection).catch(() => app.addToast("error", "Clipboard access denied: cannot copy."));
           return false;
         }
         return true;
@@ -321,13 +366,7 @@
         // preventDefault stops the browser's native paste event too; without it
         // xterm also pastes from that event and the text arrives twice.
         e.preventDefault();
-        navigator.clipboard
-          .readText()
-          .then((text) => {
-            // term.paste honours bracketed-paste mode and goes through onData.
-            if (text) term?.paste(text);
-          })
-          .catch(() => {});
+        void pasteFromClipboard();
         return false;
       }
       return true;

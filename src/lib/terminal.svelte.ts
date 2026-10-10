@@ -18,6 +18,7 @@ import { app } from "./stores.svelte";
 import { isReconnecting } from "./reconnect.svelte";
 import { settings } from "./settings.svelte";
 import { registerCommand, unregisterCommand } from "./commands.svelte";
+import type { AppError } from "./types";
 
 export interface TerminalTab {
   id: string; // termId, from term_open
@@ -78,6 +79,8 @@ export interface DetachHooks {
   activate(id: string): void;
   remap(oldId: string, newId: string): void;
   focusWindow(): void;
+  /** Splits the detached window's terminal area (§15.3.S). */
+  split(dir: "row" | "col"): void;
 }
 type ExitHandler = (code: number | null, keepOpen: boolean) => void;
 
@@ -168,6 +171,11 @@ class TerminalStore {
 
   focusWindow(): void {
     this.hooks?.focusWindow();
+  }
+
+  /** Main window, while detached: asks the terminal window to split its pane area. */
+  splitWindow(dir: "row" | "col"): void {
+    this.hooks?.split(dir);
   }
 
   /** Replaces the tab state wholesale (terminal window start, dock back, mirror update). */
@@ -399,6 +407,15 @@ class TerminalStore {
     opts: { cwd?: string; command?: string; title?: string } = {},
   ): Promise<string> {
     if (this.detached && this.hooks) return this.hooks.open(sessionId, opts);
+    if (!this.sessionList.some((s) => s.id === sessionId)) {
+      throw { kind: "Connection", message: "That session is no longer connected." } satisfies AppError;
+    }
+    if (this.sessionReconnecting(sessionId)) {
+      throw {
+        kind: "Connection",
+        message: `${this.sessionLabel(sessionId)} is reconnecting. Open the terminal once it is back.`,
+      } satisfies AppError;
+    }
     app.showTerminal = true;
     this.pendingOpens.add(sessionId);
     const ordinal = this.tabs.filter((t) => t.sessionId === sessionId).length + 1;
@@ -431,7 +448,12 @@ class TerminalStore {
     if (opts.command !== undefined) {
       const command = opts.command;
       await this.waitForFirstData(id);
-      await api.termWrite(id, command + "\r");
+      // The shell may already be gone (closed tab, dropped link): nothing to type into.
+      if (this.tabs.some((t) => t.id === id && !t.exited)) {
+        await api.termWrite(id, command + "\r").catch((err) => {
+          app.addToast("error", `Could not run the command: ${api.isAppError(err) ? err.message : String(err)}`);
+        });
+      }
     }
     return id;
   }
@@ -619,7 +641,12 @@ class TerminalStore {
     while (this.closedStack.length > 0) {
       const e = this.closedStack.pop()!;
       if (!this.sessionList.some((s) => s.id === e.sessionId)) continue;
-      await this.openNew(e.sessionId, { cwd: e.cwd, title: e.title });
+      try {
+        await this.openNew(e.sessionId, { cwd: e.cwd, title: e.title });
+      } catch (err) {
+        app.addToast("error", api.isAppError(err) ? err.message : String(err));
+        return false;
+      }
       return true;
     }
     return false;

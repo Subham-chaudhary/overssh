@@ -2,6 +2,8 @@
   // Strip shown in the main window while the terminal panel lives in its own window.
   import { terminalStore } from "../lib/terminal.svelte";
   import SquareTerminalIcon from "@lucide/svelte/icons/square-terminal";
+  import SquareSplitHorizontalIcon from "@lucide/svelte/icons/square-split-horizontal";
+  import SquareSplitVerticalIcon from "@lucide/svelte/icons/square-split-vertical";
 </script>
 
 <div
@@ -17,7 +19,25 @@
   </span>
   <button
     type="button"
-    class="ml-auto rounded px-2 py-0.5 hover:bg-accent hover:text-foreground"
+    class="ml-auto flex items-center gap-1 rounded px-2 py-0.5 hover:bg-accent hover:text-foreground"
+    title="Split the terminal window right"
+    data-testid="terminal-bar-split-right"
+    onclick={() => terminalStore.splitWindow("row")}
+  >
+    <SquareSplitHorizontalIcon size={13} /> Split right
+  </button>
+  <button
+    type="button"
+    class="flex items-center gap-1 rounded px-2 py-0.5 hover:bg-accent hover:text-foreground"
+    title="Split the terminal window down"
+    data-testid="terminal-bar-split-down"
+    onclick={() => terminalStore.splitWindow("col")}
+  >
+    <SquareSplitVerticalIcon size={13} /> Split down
+  </button>
+  <button
+    type="button"
+    class="rounded px-2 py-0.5 hover:bg-accent hover:text-foreground"
     data-testid="terminal-focus-window"
     onclick={() => terminalStore.focusWindow()}
   >

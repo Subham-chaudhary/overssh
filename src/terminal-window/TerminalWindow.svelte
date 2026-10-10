@@ -9,8 +9,11 @@
   import { isAppError } from "../lib/api";
   import { terminalStore } from "../lib/terminal.svelte";
   import { tabSwitcher } from "../lib/tabswitch.svelte";
+  import { termLayout } from "./layout.svelte";
   import TerminalPanel from "../components/TerminalPanel.svelte";
   import TabSwitcher from "../components/TabSwitcher.svelte";
+  import InputDialog from "../components/InputDialog.svelte";
+  import TitleBar from "../components/chrome/TitleBar.svelte";
   import { Toaster } from "$lib/components/ui/sonner/index.js";
   import { EV, dockBack, initTerminalWindow, watchWindowGeometry, windowState } from "./bridge.svelte";
   import * as api from "../lib/api";
@@ -84,6 +87,11 @@
       onSwitcherKey(e);
       return;
     }
+    // A confirm dialog (e.g. a large paste) owns the keyboard: no shortcuts behind it.
+    if (app.dialogRequest) {
+      if (e.key === "F5" || (mod && (key === "r" || key === "p"))) e.preventDefault();
+      return;
+    }
     if (mod && !e.shiftKey && !e.altKey && key === "w") {
       e.preventDefault();
       void terminalStore.closeActive();
@@ -99,6 +107,25 @@
       e.preventDefault();
       e.stopPropagation();
       tabSwitcher.step(e.shiftKey ? -1 : 1, "terminal");
+      return;
+    }
+    // Split panes (VS Code keys): Ctrl+\ / Ctrl+Shift+5 split right, Ctrl+Shift+\ split down.
+    if (mod && !e.altKey && (e.code === "Backslash" || (e.shiftKey && e.code === "Digit5"))) {
+      e.preventDefault();
+      e.stopPropagation();
+      void termLayout.split(e.code === "Backslash" && e.shiftKey ? "col" : "row");
+      return;
+    }
+    // Alt+Arrow moves focus between panes (only while split, so readline's Alt+Left/Right still work otherwise).
+    if (e.altKey && !mod && !e.shiftKey && termLayout.isSplit && e.key.startsWith("Arrow")) {
+      const dir = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" }[e.key] as
+        | "left"
+        | "right"
+        | "up"
+        | "down";
+      e.preventDefault();
+      e.stopPropagation();
+      termLayout.focusDirection(dir);
       return;
     }
     if (mod && (e.key === "`" || key === "j")) {
@@ -155,13 +182,17 @@
   oncontextmenucapture={onContextMenuCapture}
 />
 
-<div class="h-full w-full bg-background text-foreground" data-testid="terminal-window">
-  {#if windowState.ready}
-    <TerminalPanel detached />
-  {:else}
-    <div class="flex h-full items-center justify-center text-xs text-muted-foreground">Starting terminals...</div>
-  {/if}
+<div class="flex h-full w-full flex-col bg-background text-foreground" data-testid="terminal-window">
+  <TitleBar compact title="Terminals" />
+  <div class="min-h-0 flex-1">
+    {#if windowState.ready}
+      <TerminalPanel detached />
+    {:else}
+      <div class="flex h-full items-center justify-center text-xs text-muted-foreground">Starting terminals...</div>
+    {/if}
+  </div>
 </div>
 
 <TabSwitcher />
+<InputDialog />
 <Toaster position="bottom-right" theme={THEMES[settings.theme]?.isDark ? "dark" : "light"} />
