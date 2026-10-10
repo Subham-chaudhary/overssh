@@ -16,6 +16,7 @@
     type HostItem,
   } from "../lib/hosts.svelte";
   import QuickConnect from "./QuickConnect.svelte";
+  import ProfilesSection from "./profiles/ProfilesSection.svelte";
   import ConnectDialog, { type ConnectFormInitial } from "./ConnectDialog.svelte";
   import Loader from "./Loader.svelte";
   import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
@@ -279,6 +280,7 @@
   </div>
 
   <div class="min-h-0 flex-1 overflow-y-auto pb-1">
+    <ProfilesSection />
     {#if app.pausedSessions.length > 0}
       <div class="flex items-center gap-1.5 px-3 pt-2 pb-1 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
         <PauseIcon class="size-3" /> Paused
