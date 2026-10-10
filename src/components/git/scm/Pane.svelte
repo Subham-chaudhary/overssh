@@ -1,7 +1,6 @@
 <script lang="ts">
   // Collapsible sidebar pane (like VS Code's view panes).
   import type { Snippet } from "svelte";
-  import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
 
   let {
@@ -30,7 +29,7 @@
       data-testid={testid ? `${testid}-toggle` : undefined}
       onclick={() => (open = !open)}
     >
-      {#if open}<ChevronDownIcon class="size-3.5 shrink-0" />{:else}<ChevronRightIcon class="size-3.5 shrink-0" />{/if}
+      <ChevronRightIcon class={`motion-chevron size-3.5 shrink-0 ${open ? "motion-open" : ""}`} />
       <span class="truncate">{title}</span>
       {#if count > 0}
         <span class="ml-1 rounded-full bg-muted px-1.5 text-[10px] font-normal text-muted-foreground normal-case">{count}</span>

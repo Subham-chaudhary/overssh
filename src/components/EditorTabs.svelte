@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { fade } from "svelte/transition";
+  import { fadeParams } from "../lib/motion";
   import { app } from "../lib/stores.svelte";
   import { basename } from "../lib/paths";
   import { onActiveTabLeave } from "../lib/autosave.svelte";
@@ -70,8 +72,9 @@
       <ContextMenu.Root>
         <ContextMenu.Trigger>
           <div
+            out:fade|global={fadeParams()}
             class={[
-              "group flex h-9 items-center gap-1.5 border-r border-border px-3 text-sm whitespace-nowrap select-none",
+              "motion-tab-in group flex h-9 items-center gap-1.5 border-r border-border px-3 text-sm whitespace-nowrap select-none",
               tab.id === activeTabId
                 ? "border-t-2 border-t-primary bg-tab-active text-foreground"
                 : "border-t-2 border-t-transparent bg-tab-inactive text-muted-foreground hover:text-foreground",

@@ -43,6 +43,8 @@ export const scenario: Scenario = {
     // Esc reverts.
     await page.keyboard.press("Escape");
     await waitFor(async () => (await page.getByTestId("theme-picker").count()) === 0, "picker closed");
+    // The theme is applied inside a view transition callback (about one frame later).
+    await waitFor(async () => (await root()).theme === before.theme, "Esc reverts the theme");
     const reverted = await root();
     assert(reverted.theme === before.theme && reverted.bg === before.bg, `Esc reverts (${reverted.theme} vs ${before.theme})`);
 
@@ -53,6 +55,7 @@ export const scenario: Scenario = {
     await waitFor(async () => (await page.getByTestId("theme-picker-item").count()) === 1, "filtered to Nord");
     await page.keyboard.press("Enter");
     await waitFor(async () => (await page.getByTestId("theme-picker").count()) === 0, "picker closed on Enter");
+    await waitFor(async () => (await root()).theme === "nord", "Enter keeps Nord");
     const nord = await root();
     assert(nord.theme === "nord", `Enter keeps Nord, got ${nord.theme}`);
 

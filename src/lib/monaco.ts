@@ -18,7 +18,7 @@
 import type * as Monaco from "monaco-editor";
 import { THEMES, monacoThemeName, type ThemeId } from "./themes";
 import { monacoThemeFor } from "./appearance";
-import { settings, effectiveEditorTheme } from "./settings.svelte";
+import { appliedTheme, effectiveEditorTheme } from "./settings.svelte";
 
 export type MonacoApi = Pick<
   typeof Monaco,
@@ -93,7 +93,7 @@ function defineThemes(monaco: MonacoApi): void {
   for (const id of Object.keys(THEMES) as ThemeId[]) {
     monaco.editor.defineTheme(
       monacoThemeName(id),
-      monacoThemeFor(id, settings.appearance.accent) as Monaco.editor.IStandaloneThemeData,
+      monacoThemeFor(id, appliedTheme.accent) as Monaco.editor.IStandaloneThemeData,
     );
   }
 }

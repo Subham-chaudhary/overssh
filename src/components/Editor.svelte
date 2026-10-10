@@ -279,7 +279,15 @@
     </div>
   {:else if tab?.error}
     <div class="flex flex-col items-start gap-3 p-6 text-destructive">
-      <p>{tab.error}</p>
+      <p class="break-all">{tab.error}</p>
+      <button
+        type="button"
+        class="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm text-secondary-foreground hover:opacity-90"
+        data-testid="editor-retry"
+        onclick={() => tab && void app.reloadTab(tab.id)}
+      >
+        Retry
+      </button>
     </div>
   {:else if tab?.isBinary && !tab.forceOpen}
     <div class="flex flex-col items-start gap-3 p-6 text-muted-foreground">

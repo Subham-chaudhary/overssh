@@ -30,6 +30,11 @@ export const scenario: Scenario = {
 
     await waitFor(async () => (await page.getByTestId("theme-picker").count()) === 0, "picker closed");
 
+    // The theme is applied inside a view transition callback (about one frame later).
+    await waitFor(
+      async () => (await page.evaluate(() => document.documentElement.dataset.theme)) !== before.theme,
+      "theme applied",
+    );
     const after = await page.evaluate(() => ({
       theme: document.documentElement.dataset.theme,
       bg: getComputedStyle(document.documentElement).getPropertyValue("--background").trim(),

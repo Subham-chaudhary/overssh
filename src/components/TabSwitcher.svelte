@@ -21,7 +21,7 @@
 {#if tabSwitcher.visible}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
+    class="motion-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/30"
     style="backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);"
     data-testid="tab-switcher-backdrop"
     onmousedown={(e) => {
@@ -30,7 +30,7 @@
     }}
   >
     <div
-      class="animate-in fade-in-0 zoom-in-95 w-[480px] max-w-[92vw] overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-2xl ring-1 ring-primary/30 duration-100"
+      class="motion-pop w-[480px] max-w-[92vw] overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-2xl ring-1 ring-primary/30"
       data-testid="tab-switcher"
       data-kind={tabSwitcher.kind}
       role="listbox"

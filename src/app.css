@@ -185,3 +185,159 @@ button:focus-visible,
 *::-webkit-scrollbar-thumb:hover {
   background: var(--muted-foreground);
 }
+
+/* ---------------------------------------------------------------------------
+   Motion system (docs/GUIDE.md §15.3.A). Durations / easing mirror lib/motion.ts.
+   <html data-motion> is set by applyTheme(): "full" | "reduced" | "off"
+   ("full" becomes "reduced" under the OS prefers-reduced-motion setting).
+   --------------------------------------------------------------------------- */
+:root {
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-slow: 260ms;
+  --motion-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Hover / press / focus colour feedback for plain elements. Layered in base so
+   Tailwind's transition-* utilities still win where a component sets its own. */
+@layer base {
+  button,
+  a,
+  summary,
+  input,
+  textarea,
+  select,
+  [role="button"],
+  [role="tab"],
+  [role="menuitem"],
+  [role="option"] {
+    transition-property: color, background-color, border-color, opacity, box-shadow, text-decoration-color, fill, stroke;
+    transition-duration: var(--motion-fast);
+    transition-timing-function: var(--motion-ease);
+  }
+}
+
+/* shadcn / bits-ui popups use tw-animate-css (animate-in / animate-out with
+   fade-*, zoom-*, slide-*). Give them one duration and curve; dialogs and
+   sheets are a little slower than menus and tooltips. */
+[class*="animate-in"],
+[class*="animate-out"] {
+  --tw-animation-duration: var(--motion-fast);
+  --tw-ease: var(--motion-ease);
+}
+[data-slot="dialog-content"],
+[data-slot="alert-dialog-content"],
+[data-slot="sheet-content"] {
+  --tw-animation-duration: var(--motion-base);
+}
+
+/* Reusable utilities (also for components owned by other agents). All of them
+   are gated by data-motion below.
+   .motion-fade   opacity-only appear (view switches, lists)
+   .motion-pop    fade + slight scale-in (palettes, panels, menus)
+   .motion-slide  fade + 6px rise (toasts, inline notices)
+   .motion-backdrop  backdrop fade-in
+   .motion-chevron   rotates 90deg when [data-open="true"], aria-expanded="true" or .motion-open
+   .motion-tab-in    editor-tab open (fade + grow) */
+@keyframes motion-fade-in {
+  from { opacity: 0; }
+}
+@keyframes motion-pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+}
+@keyframes motion-slide-in {
+  from { opacity: 0; transform: translateY(6px); }
+}
+@keyframes motion-tab-in {
+  from { opacity: 0; transform: translateX(-6px); }
+}
+.motion-fade { animation: motion-fade-in var(--motion-fast) var(--motion-ease) backwards; }
+.motion-backdrop { animation: motion-fade-in var(--motion-base) var(--motion-ease) backwards; }
+.motion-pop { animation: motion-pop-in var(--motion-fast) var(--motion-ease) backwards; }
+.motion-slide { animation: motion-slide-in var(--motion-base) var(--motion-ease) backwards; }
+.motion-tab-in { animation: motion-tab-in var(--motion-fast) var(--motion-ease) backwards; }
+.motion-chevron {
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+.motion-chevron[data-open="true"],
+.motion-chevron[aria-expanded="true"],
+.motion-chevron.motion-open {
+  transform: rotate(90deg);
+}
+
+/* reduced: opacity only, no movement or scale. */
+html[data-motion="reduced"] {
+  --motion-ease: ease-out;
+}
+html[data-motion="reduced"] [class*="animate-in"],
+html[data-motion="reduced"] [class*="animate-out"] {
+  --tw-enter-scale: 1 !important;
+  --tw-exit-scale: 1 !important;
+  --tw-enter-translate-x: 0 !important;
+  --tw-enter-translate-y: 0 !important;
+  --tw-exit-translate-x: 0 !important;
+  --tw-exit-translate-y: 0 !important;
+}
+html[data-motion="reduced"] .motion-pop,
+html[data-motion="reduced"] .motion-slide,
+html[data-motion="reduced"] .motion-tab-in {
+  animation-name: motion-fade-in;
+}
+html[data-motion="reduced"] .motion-chevron {
+  transition: none;
+}
+
+/* off: nothing animates (bits-ui unmounts immediately when animation-name is none). */
+html[data-motion="off"] {
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+  --motion-slow: 0ms;
+}
+html[data-motion="off"] [class*="animate-in"],
+html[data-motion="off"] [class*="animate-out"],
+html[data-motion="off"] .motion-fade,
+html[data-motion="off"] .motion-backdrop,
+html[data-motion="off"] .motion-pop,
+html[data-motion="off"] .motion-slide,
+html[data-motion="off"] .motion-tab-in {
+  animation: none !important;
+}
+html[data-motion="off"] *,
+html[data-motion="off"] *::before,
+html[data-motion="off"] *::after {
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+}
+
+/* Toasts (svelte-sonner): keep its slide / fade but shorter than its 400ms. */
+[data-sonner-toast] {
+  transition-duration: var(--motion-slow) !important;
+}
+
+/* Theme switch (lib/motion.ts runThemeTransition): the browser snapshots the
+   page; lib/motion.ts animates ::view-transition-new(root) (circular reveal or
+   crossfade). Pointer events pass through to the live page, so nothing blocks
+   clicks while it runs. Colour transitions are paused during the switch so the
+   live page does not fade underneath the snapshot. */
+::view-transition {
+  pointer-events: none;
+}
+::view-transition-group(root) {
+  animation: none;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-old(root) {
+  z-index: 0;
+}
+::view-transition-new(root) {
+  z-index: 1;
+}
+html[data-theme-switching] *,
+html[data-theme-switching] *::before,
+html[data-theme-switching] *::after {
+  transition: none !important;
+}

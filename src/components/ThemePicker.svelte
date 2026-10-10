@@ -6,6 +6,7 @@
   // the theme that was active when the picker opened.
   import { tick, untrack } from "svelte";
   import { settings } from "../lib/settings.svelte";
+  import { hintThemeFade } from "../lib/motion";
   import { THEME_LIST, type ThemeDef, type ThemeId } from "../lib/themes";
   import { themeSwatches } from "../lib/appearance";
   import { themePicker, closeThemePicker } from "../lib/themepicker.svelte";
@@ -47,7 +48,10 @@
   $effect(() => {
     if (!themePicker.open) return;
     const t = flat[index];
-    if (t && untrack(() => settings.theme) !== t.id) settings.theme = t.id;
+    if (t && untrack(() => settings.theme) !== t.id) {
+      hintThemeFade();
+      settings.theme = t.id;
+    }
     void tick().then(() =>
       document.querySelector('[data-testid="theme-picker"] [aria-selected="true"]')?.scrollIntoView({ block: "nearest" }),
     );
@@ -66,7 +70,10 @@
   }
 
   function cancel(): void {
-    if (!committed) settings.theme = original;
+    if (!committed) {
+      hintThemeFade();
+      settings.theme = original;
+    }
     closeThemePicker();
   }
 
@@ -92,7 +99,7 @@
 {#if themePicker.open}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
+    class="motion-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/30"
     style="backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);"
     data-testid="theme-picker-backdrop"
     onmousedown={(e) => {
@@ -103,7 +110,7 @@
     }}
   >
     <div
-      class="animate-in fade-in-0 zoom-in-95 w-[480px] max-w-[92vw] overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-2xl ring-1 ring-primary/30 duration-100"
+      class="motion-pop w-[480px] max-w-[92vw] overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-2xl ring-1 ring-primary/30"
       data-testid="theme-picker"
       role="listbox"
       aria-label="Color theme"

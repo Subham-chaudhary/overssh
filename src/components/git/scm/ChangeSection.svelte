@@ -5,7 +5,6 @@
   import { buildChangeTree, treeFiles, type Change, type ChangeTreeNode } from "$lib/git/status";
   import ChangeRow from "./ChangeRow.svelte";
   import IconButton from "./IconButton.svelte";
-  import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import MinusIcon from "@lucide/svelte/icons/minus";
@@ -14,6 +13,9 @@
   let { kind, title, items }: { kind: "merge" | "staged" | "changes"; title: string; items: Change[] } = $props();
 
   let open = $state(true);
+  /** List mode renders at most this many rows (a repo can report tens of thousands of untracked files). */
+  const PAGE = 500;
+  let limit = $state(PAGE);
   const collapsed = new SvelteSet<string>();
   const tree = $derived(gitStore.viewMode === "tree" ? buildChangeTree(items) : []);
 
@@ -38,7 +40,7 @@
         aria-expanded={open}
         onclick={() => (open = !open)}
       >
-        {#if open}<ChevronDownIcon class="size-3.5 shrink-0" />{:else}<ChevronRightIcon class="size-3.5 shrink-0" />{/if}
+        <ChevronRightIcon class={`motion-chevron size-3.5 shrink-0 ${open ? "motion-open" : ""}`} />
         <span class="truncate">{title}</span>
       </button>
       <span class="hidden items-center gap-0.5 group-focus-within:flex group-hover:flex">
@@ -59,9 +61,17 @@
       {#if gitStore.viewMode === "tree"}
         {@render nodes(tree, 0)}
       {:else}
-        {#each items as c (c.path)}
+        {#each items.length > limit ? items.slice(0, limit) : items as c (c.path)}
           <ChangeRow change={c} {kind} />
         {/each}
+        {#if items.length > limit}
+          <button
+            type="button"
+            class="ml-5 h-[22px] text-[11px] text-primary hover:underline"
+            data-testid="scm-show-more-{kind}"
+            onclick={() => (limit += PAGE * 4)}
+          >Show {Math.min(items.length - limit, PAGE * 4)} more of {items.length - limit}</button>
+        {/if}
       {/if}
     {/if}
   </div>
@@ -79,7 +89,7 @@
         data-path={n.path}
       >
         <button type="button" class="flex min-w-0 flex-1 items-center gap-0.5 text-left outline-none" onclick={() => toggle(n.path)}>
-          {#if collapsed.has(n.path)}<ChevronRightIcon class="size-3.5 shrink-0" />{:else}<ChevronDownIcon class="size-3.5 shrink-0" />{/if}
+          <ChevronRightIcon class={`motion-chevron size-3.5 shrink-0 ${collapsed.has(n.path) ? "" : "motion-open"}`} />
           <span class="truncate">{n.name}</span>
         </button>
         <span class="hidden items-center gap-0.5 group-focus-within:flex group-hover:flex">

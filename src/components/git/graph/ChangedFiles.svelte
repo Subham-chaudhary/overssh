@@ -2,7 +2,6 @@
   // Changed-file list or tree for a commit (docs/GUIDE.md §14.4.G2).
   import FileTypeIcon from "../../FileTypeIcon.svelte";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
-  import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import { flattenTree, STATUS_LABEL, type ChangeStatus, type FileChange } from "../../../lib/git/diff";
 
   let {
@@ -88,7 +87,7 @@
             data-testid="changed-dir"
             onclick={() => toggle(r.path)}
           >
-            {#if collapsed.has(r.path)}<ChevronRightIcon class="size-3.5 shrink-0" />{:else}<ChevronDownIcon class="size-3.5 shrink-0" />{/if}
+            <ChevronRightIcon class={`motion-chevron size-3.5 shrink-0 ${collapsed.has(r.path) ? "" : "motion-open"}`} />
             <span class="truncate">{r.name}</span>
           </button>
         {:else if r.change}
