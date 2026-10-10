@@ -16,7 +16,7 @@ use russh::keys::{self, HashAlg};
 use russh::{Channel, ChannelStream, Disconnect};
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -203,6 +203,11 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const KEEPALIVE_MAX: usize = 3;
 /// How long `session_ping` waits for the server before calling the link dead.
 const PING_TIMEOUT: Duration = Duration::from_secs(8);
+/// Upper bound for the whole authentication exchange of one hop (keys, agent,
+/// password). A server that stops answering mid-auth must not hang `connect`.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(45);
+/// Upper bound for opening the SFTP subsystem after authentication.
+const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 /// One SSH endpoint in a (possibly proxied) connection: a jump host or the final target.
@@ -293,7 +298,8 @@ pub async fn connect(app: &AppHandle, req: ConnectRequest) -> Result<Session, Ap
         let parsed = load_config()?;
         let host_cfg = parsed.resolve(alias);
         config_jump = host_cfg.proxy_jump.clone();
-        config_proxy_command = host_cfg.proxy_command.clone();
+        // `ProxyCommand none` (OpenSSH) means "no proxy command".
+        config_proxy_command = host_cfg.proxy_command.clone().filter(|c| !c.trim().eq_ignore_ascii_case("none"));
 
         (
             host_cfg.hostname,
@@ -411,13 +417,34 @@ pub async fn connect(app: &AppHandle, req: ConnectRequest) -> Result<Session, Ap
             final_handle = Some(handle);
         }
     }
-    let handle = final_handle.expect("targets always has the final hop");
+    let handle = final_handle
+        .ok_or_else(|| AppError::Connection { message: "no target host to connect to".into() })?;
 
     // --- Open the SFTP subsystem once, use it for the life of the session ------
-    let channel = handle.channel_open_session().await?;
-    channel.request_subsystem(true, "sftp").await?;
-    let sftp = SftpSession::new(channel.into_stream()).await?;
-    let home = sftp.canonicalize(".").await?;
+    // Bounded: a server with the sftp subsystem disabled never answers the
+    // SFTP `init`, and a half-dead link must not leave "Connecting…" forever.
+    let open_sftp = async {
+        let channel = handle.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(channel.into_stream()).await?;
+        let home = sftp.canonicalize(".").await?;
+        Ok::<_, AppError>((sftp, home))
+    };
+    let (sftp, home) = match tokio::time::timeout(SFTP_OPEN_TIMEOUT, open_sftp).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+            return Err(AppError::Connection {
+                message: format!("Could not start SFTP on {hostname} (is the sftp subsystem enabled?): {e}"),
+            });
+        }
+        Err(_) => {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+            return Err(AppError::Connection {
+                message: format!("Timed out starting SFTP on {hostname} (is the sftp subsystem enabled?)"),
+            });
+        }
+    };
 
     Ok(Session {
         id: session_id,
@@ -492,7 +519,16 @@ async fn dial_and_auth(
                         "REMOTE HOST IDENTIFICATION HAS CHANGED for {shown}! This could indicate a man-in-the-middle attack."
                     ),
                 },
-                None => err,
+                Some(HostKeyStatus::Unreadable(why)) => AppError::Connection {
+                    message: format!("Could not verify the host key of {shown}: {why}"),
+                },
+                // DNS failure, refused, reset…: say which host it was.
+                None => match err {
+                    AppError::Connection { message } => AppError::Connection {
+                        message: format!("Could not connect to {}:{}: {message}", t.hostname, t.port),
+                    },
+                    other => other,
+                },
             });
         }
         Err(_elapsed) => {
@@ -502,8 +538,19 @@ async fn dial_and_auth(
         }
     };
 
-    authenticate(&mut handle, t, creds, hop).await?;
-    Ok(handle)
+    match tokio::time::timeout(AUTH_TIMEOUT, authenticate(&mut handle, t, creds, hop)).await {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(e)) => {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+            Err(AppError::Connection {
+                message: format!("Authentication with {}:{} timed out", t.hostname, t.port),
+            })
+        }
+    }
 }
 
 async fn authenticate(
@@ -665,6 +712,8 @@ async fn try_agent(
 enum HostKeyStatus {
     Unknown(String),
     Changed,
+    /// known_hosts could not be read/parsed (permissions, I/O error…).
+    Unreadable(String),
 }
 
 /// Per-connection `russh` handler. Owns nothing that outlives the connection
@@ -724,7 +773,17 @@ impl client::Handler for ClientHandler {
                 }
                 Ok(false)
             }
-            Err(_) => Ok(false),
+            Err(e) => {
+                // Never connect without a verified key, but say why instead of
+                // a bare "unknown key" failure.
+                if let Ok(mut status) = self.host_key_status.lock() {
+                    *status = Some(HostKeyStatus::Unreadable(format!(
+                        "cannot read {} ({e})",
+                        self.known_hosts_path.display()
+                    )));
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -755,13 +814,18 @@ impl client::Handler for ClientHandler {
                 "session://closed",
                 serde_json::json!({ "sessionId": self.session_id, "reason": reason_message }),
             );
-            // Forwards die with their connection.
-            if let Some(fw) = self.app.try_state::<forward::ForwardManager>() {
-                let fw = fw.inner().clone();
-                let app = self.app.clone();
-                let sid = self.session_id.clone();
-                tokio::spawn(async move { fw.stop_for_session(&app, &sid).await });
-            }
+            // Everything bound to the connection dies with it: forwards,
+            // terminals, log/docker streams, monitor, transfers, and the
+            // session entry itself (so later calls fail fast with NotFound
+            // instead of timing out on a dead link).
+            let app = self.app.clone();
+            let sid = self.session_id.clone();
+            let lost = if reason_message.is_empty() {
+                "Connection to the server was lost".to_string()
+            } else {
+                format!("Connection to the server was lost: {reason_message}")
+            };
+            tokio::spawn(async move { crate::commands::cleanup_session(&app, &sid, Some(&lost)).await });
         }
         match reason {
             client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),

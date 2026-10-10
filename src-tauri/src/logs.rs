@@ -24,6 +24,10 @@ use crate::session::{Msg, Session, SessionManager};
 const BATCH_LINES: usize = 500;
 const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_TAIL: u32 = 1000;
+/// Longest line kept whole; longer runs without `\n` are split.
+pub const MAX_LINE_BYTES: usize = 256 * 1024;
+/// Output kept from the one-shot `logs_discover` probe.
+const DISCOVER_CAP: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,7 +65,6 @@ impl LogManager {
 
     /// Best-effort close of every stream of `session_id` (for callers that
     /// tear a session down). Closing the SSH connection ends them anyway.
-    #[allow(dead_code)]
     pub async fn close_for_session(&self, session_id: &str) {
         let ids: Vec<String> = self
             .streams
@@ -152,6 +155,21 @@ impl LineSplitter {
             }
         }
         self.carry.extend_from_slice(&chunk[start..]);
+        // A stream with no newline at all (binary file, minified JSON…) must
+        // not grow the carry without bound: emit it in pieces.
+        while self.carry.len() > MAX_LINE_BYTES {
+            let mut cut = MAX_LINE_BYTES;
+            // Don't split a UTF-8 sequence: back up to a char start.
+            while cut > 0 && (self.carry[cut] & 0xC0) == 0x80 {
+                cut -= 1;
+            }
+            if cut == 0 {
+                cut = MAX_LINE_BYTES;
+            }
+            let rest = self.carry.split_off(cut);
+            let mut head = std::mem::replace(&mut self.carry, rest);
+            out.push(take_line(&mut head));
+        }
     }
 
     /// Emits the held partial line (stream ended without a final newline).
@@ -344,7 +362,9 @@ pub async fn logs_discover(
     let _ = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                ChannelMsg::Data { data } => {
+                    crate::git::push_capped(&mut out, &data, DISCOVER_CAP);
+                }
                 ChannelMsg::Close => break,
                 _ => {}
             }
@@ -372,6 +392,25 @@ mod tests {
     #[test]
     fn splits_and_keeps_partial_lines() {
         assert_eq!(split_all(&[b"a\nb", b"c\nd\n"]), vec!["a", "bc", "d"]);
+    }
+
+    #[test]
+    fn endless_line_is_split_and_bounded() {
+        let mut s = LineSplitter::default();
+        let mut out = Vec::new();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..10 {
+            s.push(&chunk, &mut out);
+        }
+        assert!(s.carry.len() <= MAX_LINE_BYTES);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|l| l.len() <= MAX_LINE_BYTES));
+        // multibyte chars are never cut in half
+        let mut s = LineSplitter::default();
+        let mut out = Vec::new();
+        s.push("\u{20ac}".repeat(MAX_LINE_BYTES).as_bytes(), &mut out);
+        s.finish(&mut out);
+        assert!(out.iter().all(|l| !l.contains('\u{FFFD}')));
     }
 
     #[test]

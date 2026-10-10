@@ -48,7 +48,7 @@ pub fn default_config_path() -> Option<PathBuf> {
 
 /// Parse a file, following `Include` directives. Missing file → `Ok(SshConfig::default())`.
 pub fn parse_file(path: &Path) -> io::Result<SshConfig> {
-    match fs::read_to_string(path) {
+    match read_text(path) {
         Ok(content) => {
             let ssh_dir = path.parent().unwrap_or(Path::new("."));
             Ok(parse_str(&content, ssh_dir))
@@ -58,16 +58,30 @@ pub fn parse_file(path: &Path) -> io::Result<SshConfig> {
     }
 }
 
+/// Reads a config file as text. Lossy (one stray non-UTF-8 byte, e.g. a
+/// Latin-1 comment, must not hide every host) and without a UTF-8 BOM
+/// (Notepad adds one, which used to turn the first `Host` into an unknown key).
+fn read_text(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
 /// Parse text. Relative `Include` paths resolve against `ssh_dir` (normally `~/.ssh`).
 pub fn parse_str(text: &str, ssh_dir: &Path) -> SshConfig {
-    let expanded_text = preprocess_includes(text, ssh_dir, 0);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut stack = Vec::new();
+    let expanded_text = preprocess_includes(text, ssh_dir, 0, &mut stack);
     let mut config = SshConfig::default();
     parse_expanded(&expanded_text, &mut config);
     config
 }
 
 /// Preprocess the config text to expand all Include directives.
-fn preprocess_includes(text: &str, ssh_dir: &Path, depth: usize) -> String {
+/// `stack` holds the files currently being expanded: a file that (directly or
+/// through a glob) includes itself is skipped instead of being expanded again
+/// at every level up to the depth limit.
+fn preprocess_includes(text: &str, ssh_dir: &Path, depth: usize, stack: &mut Vec<PathBuf>) -> String {
     if depth > 16 {
         return text.to_string();
     }
@@ -89,8 +103,14 @@ fn preprocess_includes(text: &str, ssh_dir: &Path, depth: usize) -> String {
             for path_spec in value.split_whitespace() {
                 let include_paths = resolve_include_path(path_spec, ssh_dir);
                 for include_path in include_paths {
-                    if let Ok(content) = fs::read_to_string(&include_path) {
-                        let expanded = preprocess_includes(&content, ssh_dir, depth + 1);
+                    let key = fs::canonicalize(&include_path).unwrap_or_else(|_| include_path.clone());
+                    if stack.contains(&key) || include_path.is_dir() {
+                        continue; // include cycle, or a directory matched by a glob
+                    }
+                    if let Ok(content) = read_text(&include_path) {
+                        stack.push(key);
+                        let expanded = preprocess_includes(&content, ssh_dir, depth + 1, stack);
+                        stack.pop();
                         result.push_str(&expanded);
                     }
                     // Missing files are ignored
@@ -181,26 +201,20 @@ fn parse_expanded(text: &str, config: &mut SshConfig) {
 /// Handles both `Key value` and `Key=value` (and `Key = value`) formats.
 /// Removes quotes from values.
 fn parse_line(line: &str) -> (String, String) {
-    let trimmed = line.trim_start();
+    let trimmed = line.trim();
 
-    // Check for `Key=value` format (handles `Key = value` too)
-    if let Some(eq_pos) = trimmed.find('=') {
-        let key = trimmed[..eq_pos].trim().to_string();
-        let value_part = trimmed[eq_pos + 1..].trim();
-        let value = unquote(value_part).to_string();
-        return (key, value);
+    // The key ends at the first whitespace or `=` (OpenSSH semantics). An `=`
+    // further right belongs to the value: `ProxyCommand ssh -o A=b host` used
+    // to be split at that `=`, losing the key.
+    let key_end = trimmed
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(trimmed.len());
+    let key = trimmed[..key_end].to_string();
+    let mut rest = trimmed[key_end..].trim_start();
+    if let Some(r) = rest.strip_prefix('=') {
+        rest = r.trim_start();
     }
-
-    // `Key value` format
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let key = parts.next().unwrap_or("").to_string();
-    let value = if let Some(val_str) = parts.next() {
-        unquote(val_str).to_string()
-    } else {
-        String::new()
-    };
-
-    (key, value)
+    (key, unquote(rest).to_string())
 }
 
 /// Remove surrounding double quotes if present.
@@ -447,7 +461,9 @@ fn apply_settings(
         let Some(val) = values.first() else { continue };
         let applied = match key.as_str() {
             "hostname" if !seen.contains(key) => {
-                config.hostname = val.clone();
+                // `%h` is the host name given on the command line (the alias);
+                // `%%` is a literal `%`.
+                config.hostname = val.replace("%%", "\u{0}").replace("%h", &config.alias).replace('\u{0}', "%");
                 true
             }
             "user" if !seen.contains(key) => {
@@ -659,6 +675,35 @@ Host !staging.example.com
         // staging.example.com matches *.example.com but is negated by !staging.example.com
         // So it doesn't match the second block
         assert_eq!(resolved2.user, Some("alice".to_string()));
+    }
+
+    #[test]
+    fn test_equals_inside_value_keeps_key() {
+        let config = parse_str("Host a\n    ProxyCommand ssh -o Foo=bar -W %h:%p jump\n    Port=2222\n", Path::new("."));
+        let a = config.resolve("a");
+        assert_eq!(a.proxy_command.as_deref(), Some("ssh -o Foo=bar -W %h:%p jump"));
+        assert_eq!(a.port, 2222);
+        assert_eq!(parse_line("  User = bob  "), ("User".into(), "bob".into()));
+        assert_eq!(parse_line("HostName\t\"10.0.0.1\""), ("HostName".into(), "10.0.0.1".into()));
+    }
+
+    #[test]
+    fn test_bom_and_hostname_token() {
+        let config = parse_str("\u{feff}Host web\n    HostName %h.example.com\n", Path::new("."));
+        assert_eq!(config.resolve("web").hostname, "web.example.com");
+        assert_eq!(config.concrete_hosts(), vec!["web".to_string()]);
+    }
+
+    #[test]
+    fn test_self_include_does_not_loop() {
+        let dir = std::env::temp_dir().join(format!("overssh-cfg-loop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config");
+        std::fs::write(&f, "Include config\nHost x\n    HostName 1.2.3.4\n").unwrap();
+        let c = parse_file(&f).unwrap();
+        assert_eq!(c.resolve("x").hostname, "1.2.3.4");
+        assert_eq!(c.host_blocks.len(), 2); // the file once + one self-include, not 17 levels
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

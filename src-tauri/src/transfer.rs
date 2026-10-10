@@ -118,8 +118,27 @@ pub fn is_safe_local_name(name: &str, windows: bool) -> bool {
         if name.ends_with('.') || name.ends_with(' ') {
             return false;
         }
+        if is_windows_reserved(name) {
+            return false;
+        }
     }
     true
+}
+
+/// `CON`, `nul.txt`, `COM1.log`…: Windows maps these to devices whatever the
+/// extension, so writing a remote file of that name would go to a device (or
+/// fail) instead of creating a file.
+pub fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ').to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            let b = stem.as_bytes();
+            b.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && (b'1'..=b'9').contains(&b[3])
+        }
+    }
 }
 
 /// Destination path of `rel` (POSIX-style, relative, root name first) below `dest_dir`.
@@ -225,6 +244,9 @@ struct JobCtl {
     sessions: Vec<String>,
     cancel_tx: watch::Sender<bool>,
     resolver: Mutex<Option<oneshot::Sender<Policy>>>,
+    /// Set when the job was stopped because its connection dropped: the job
+    /// then ends with this error instead of as "cancelled by the user".
+    abort_reason: Mutex<Option<String>>,
 }
 
 impl JobCtl {
@@ -246,11 +268,15 @@ impl TransferManager {
         Self::default()
     }
 
-    /// Cancels every job that reads from or writes to `session_id`.
-    pub fn cancel_for_session(&self, session_id: &str) {
-        let jobs = self.jobs.lock().unwrap();
+    /// Cancels every job that reads from or writes to `session_id`. With a
+    /// `reason` (the link dropped) the jobs end with that error, not as cancelled.
+    pub fn cancel_for_session(&self, session_id: &str, reason: Option<&str>) {
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for ctl in jobs.values() {
             if ctl.sessions.iter().any(|s| s == session_id) {
+                if let (Some(r), false) = (reason, ctl.is_cancelled()) {
+                    ctl.abort_reason.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| r.to_string());
+                }
                 ctl.cancel();
             }
         }
@@ -327,7 +353,7 @@ impl Progress {
             bytes_total: total,
             files_done: self.files_done.load(Ordering::Relaxed),
             files_total: self.files_total.load(Ordering::Relaxed),
-            current_path: self.current.lock().unwrap().clone(),
+            current_path: self.current.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             rate_bps: rate,
             eta_secs: eta_secs(total, done, rate),
             scanning: self.scanning.load(Ordering::Relaxed),
@@ -536,9 +562,13 @@ impl Endpoint {
                 if keep_mode && mode != 0 {
                     attrs.permissions = Some(mode);
                 }
-                if mtime > 0 {
-                    attrs.atime = Some(mtime as u32);
-                    attrs.mtime = Some(mtime as u32);
+                // SFTP v3 times are u32: skip values that do not fit instead
+                // of writing a wrapped-around date.
+                if let Ok(t) = u32::try_from(mtime) {
+                    if t > 0 {
+                        attrs.atime = Some(t);
+                        attrs.mtime = Some(t);
+                    }
                 }
                 if attrs.permissions.is_some() || attrs.mtime.is_some() {
                     let _ = s.sftp.set_metadata(path, attrs).await;
@@ -587,7 +617,13 @@ async fn scan(
     let mut items: Vec<Item> = Vec::new();
     for root in roots {
         let root_name = match rename {
-            Some(r) if roots.len() == 1 => Some(r.to_string()),
+            Some(r) if roots.len() == 1 => {
+                // A new name is one path segment: it must not walk out of `dest`.
+                if !is_safe_local_name(r, false) {
+                    return Err(AppError::config(format!("'{r}' is not a valid file name")));
+                }
+                Some(r.to_string())
+            }
             _ => {
                 if src.is_local() {
                     local_basename(root)
@@ -621,7 +657,7 @@ async fn scan(
                 Err(e) => {
                     // An unreadable subfolder fails that folder, not the whole job.
                     progress.failed.fetch_add(1, Ordering::Relaxed);
-                    progress.current.lock().unwrap().clone_from(&format!("{dir}: {e}"));
+                    progress.current.lock().unwrap_or_else(|e| e.into_inner()).clone_from(&format!("{dir}: {e}"));
                     continue;
                 }
             };
@@ -695,7 +731,7 @@ impl Shared {
         let mut p = self.policy.lock().await;
         if *p == Policy::Ask {
             let (tx, rx) = oneshot::channel();
-            *self.ctl.resolver.lock().unwrap() = Some(tx);
+            *self.ctl.resolver.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
             let _ = self.app.emit(
                 "transfer://conflict",
                 ConflictPayload { job_id: self.job_id.clone(), path: path.to_string() },
@@ -715,7 +751,7 @@ impl Shared {
 
     fn note_failure(&self, path: &str, err: &AppError) {
         self.progress.failed.fetch_add(1, Ordering::Relaxed);
-        let mut f = self.failures.lock().unwrap();
+        let mut f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         if f.len() < MAX_FAILURE_SAMPLES {
             f.push(format!("{path}: {err}"));
         }
@@ -723,7 +759,7 @@ impl Shared {
 
     async fn transfer_one(&self, item: &Item, writing: &AtomicBool) -> Result<Outcome, AppError> {
         let dst_path = self.dst_path(&item.rel);
-        *self.progress.current.lock().unwrap() = item.rel.clone();
+        *self.progress.current.lock().unwrap_or_else(|e| e.into_inner()) = item.rel.clone();
 
         if let Some(existing) = self.dst.stat(&dst_path).await? {
             if existing.is_dir {
@@ -812,6 +848,15 @@ impl Shared {
     }
 }
 
+/// Aborts the wrapped task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn sub_saturating(a: &AtomicU64, v: u64) {
     let _ = a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(v)));
 }
@@ -832,7 +877,9 @@ async fn run_job(
     progress.scanning.store(true, Ordering::Relaxed);
 
     // One ticker for the whole job (scan included), throttled to PROGRESS_EVERY.
-    let ticker = {
+    // Wrapped so it is aborted however this function ends (even by a panic),
+    // never emitting progress for a dead job forever.
+    let ticker = AbortOnDrop({
         let app = app.clone();
         let progress = progress.clone();
         let job_id = job_id.clone();
@@ -849,7 +896,7 @@ async fn run_job(
                 let _ = app.emit("transfer://progress", progress.payload(&job_id, rate));
             }
         })
-    };
+    });
 
     let mut summary = JobSummary::default();
     let mut cancel_rx = ctl.cancel_tx.subscribe();
@@ -872,8 +919,10 @@ async fn run_job(
     let items = match items {
         Ok(i) => i,
         Err(e) => {
-            ticker.abort();
-            if ctl.is_cancelled() {
+            ticker.0.abort();
+            if let Some(r) = ctl.abort_reason.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                summary.fatal = Some(AppError::Connection { message: r });
+            } else if ctl.is_cancelled() {
                 summary.cancelled = true;
             } else {
                 summary.fatal = Some(e);
@@ -917,14 +966,17 @@ async fn run_job(
         set.spawn(shared.clone().worker());
     }
     while set.join_next().await.is_some() {}
-    ticker.abort();
+    ticker.0.abort();
 
-    summary.cancelled = ctl.is_cancelled();
+    match ctl.abort_reason.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        Some(r) => summary.fatal = Some(AppError::Connection { message: r }),
+        None => summary.cancelled = ctl.is_cancelled(),
+    }
     summary.failed = progress.failed.load(Ordering::Relaxed);
     summary.skipped = progress.skipped.load(Ordering::Relaxed);
     summary.files_done = progress.files_done.load(Ordering::Relaxed);
     summary.bytes_done = progress.bytes_done.load(Ordering::Relaxed);
-    summary.failures = shared.failures.lock().unwrap().clone();
+    summary.failures = shared.failures.lock().unwrap_or_else(|e| e.into_inner()).clone();
     // Last word so the UI shows the final numbers before `done`.
     let _ = app.emit("transfer://progress", progress.payload(&job_id, 0));
     summary
@@ -963,15 +1015,20 @@ async fn start_job(
 
     let job_id = uuid::Uuid::new_v4().to_string();
     let (cancel_tx, _rx) = watch::channel(false);
-    let ctl = Arc::new(JobCtl { sessions: session_ids, cancel_tx, resolver: Mutex::new(None) });
-    mgr.jobs.lock().unwrap().insert(job_id.clone(), ctl.clone());
+    let ctl = Arc::new(JobCtl {
+        sessions: session_ids,
+        cancel_tx,
+        resolver: Mutex::new(None),
+        abort_reason: Mutex::new(None),
+    });
+    mgr.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(job_id.clone(), ctl.clone());
 
     let jobs = mgr.jobs.clone();
     let app = app.clone();
     let id = job_id.clone();
     let handle = tokio::spawn(async move {
         let summary = run_job(app.clone(), id.clone(), spec, src, dst, ctl).await;
-        jobs.lock().unwrap().remove(&id);
+        jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         let _ = app.emit(
             "transfer://done",
             DonePayload {
@@ -1024,7 +1081,7 @@ pub async fn transfer_start(
 /// Cancels a running job (idempotent; unknown ids are ignored). Half-written files are removed.
 #[tauri::command]
 pub async fn transfer_cancel(mgr: State<'_, TransferManager>, job_id: String) -> Result<(), AppError> {
-    if let Some(ctl) = mgr.jobs.lock().unwrap().get(&job_id) {
+    if let Some(ctl) = mgr.jobs.lock().unwrap_or_else(|e| e.into_inner()).get(&job_id) {
         ctl.cancel();
     }
     Ok(())
@@ -1037,9 +1094,9 @@ pub async fn transfer_resolve(
     job_id: String,
     policy: Policy,
 ) -> Result<(), AppError> {
-    let ctl = mgr.jobs.lock().unwrap().get(&job_id).cloned();
+    let ctl = mgr.jobs.lock().unwrap_or_else(|e| e.into_inner()).get(&job_id).cloned();
     if let Some(ctl) = ctl {
-        if let Some(tx) = ctl.resolver.lock().unwrap().take() {
+        if let Some(tx) = ctl.resolver.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = tx.send(policy);
         }
     }
@@ -1118,6 +1175,13 @@ mod tests {
         assert!(!is_safe_local_name("what?", true));
         assert!(!is_safe_local_name("trailing.", true));
         assert!(is_safe_local_name(".hidden", true));
+        for bad in ["CON", "nul", "Aux.txt", "com1", "LPT9.log", "con .txt"] {
+            assert!(!is_safe_local_name(bad, true), "{bad}");
+            assert!(is_safe_local_name(bad, false), "{bad}");
+        }
+        for ok in ["COM", "COM0", "console", "nullable.txt", "lpt10"] {
+            assert!(is_safe_local_name(ok, true), "{ok}");
+        }
     }
 
     #[test]

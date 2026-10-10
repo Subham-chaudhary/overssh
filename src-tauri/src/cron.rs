@@ -8,6 +8,7 @@ use crate::error::AppError;
 use crate::session::{Session, SessionManager};
 
 const MAX_CRON_BYTES: usize = 1_000_000;
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Runs `cmd`, optionally feeding `stdin`; returns (exit code, combined output).
 async fn exec_collect(session: &Session, cmd: &str, stdin: Option<&[u8]>) -> Result<(Option<u32>, String), AppError> {
@@ -19,17 +20,22 @@ async fn exec_collect(session: &Session, cmd: &str, stdin: Option<&[u8]>) -> Res
     let _ = channel.eof().await;
     let mut out: Vec<u8> = Vec::new();
     let mut code = None;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                if out.len() < MAX_CRON_BYTES {
-                    out.extend_from_slice(&data);
+    let read = async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    crate::git::push_capped(&mut out, &data, MAX_CRON_BYTES);
                 }
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                ChannelMsg::Close => break,
+                _ => {}
             }
-            ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-            ChannelMsg::Close => break,
-            _ => {}
         }
+    };
+    // `crontab` answers at once; a hung exec channel must not hang the editor.
+    if tokio::time::timeout(EXEC_TIMEOUT, read).await.is_err() {
+        let _ = channel.close().await;
+        return Err(AppError::Io { message: format!("`{cmd}` timed out") });
     }
     Ok((code, String::from_utf8_lossy(&out).into_owned()))
 }

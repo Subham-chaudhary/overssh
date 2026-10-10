@@ -24,6 +24,21 @@ pub struct GitOutput {
     pub truncated: bool,
 }
 
+/// Appends `data` to `buf` without letting it grow past `cap`. Returns `true`
+/// when something was cut. Once full, nothing more is appended, so a capped
+/// buffer is always a clean prefix of the stream (never a prefix with holes,
+/// which is what "skip a chunk that does not fit, keep later small ones" gave).
+pub fn push_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) -> bool {
+    let room = cap.saturating_sub(buf.len());
+    if data.len() <= room {
+        buf.extend_from_slice(data);
+        false
+    } else {
+        buf.extend_from_slice(&data[..room]);
+        true
+    }
+}
+
 /// POSIX single-quote quoting; safe for any byte except NUL.
 pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -79,16 +94,12 @@ pub async fn git_run(
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { data } => {
-                if out.len() + data.len() <= MAX_OUT_BYTES {
-                    out.extend_from_slice(&data);
-                } else {
+                if push_capped(&mut out, &data, MAX_OUT_BYTES) {
                     truncated = true;
                 }
             }
             ChannelMsg::ExtendedData { data, .. } => {
-                if err.len() < 1_000_000 {
-                    err.extend_from_slice(&data);
-                }
+                push_capped(&mut err, &data, 1_000_000);
             }
             ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
             ChannelMsg::Close => break,
@@ -106,6 +117,15 @@ pub async fn git_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_capped_keeps_a_clean_prefix() {
+        let mut b = Vec::new();
+        assert!(!push_capped(&mut b, b"abc", 5));
+        assert!(push_capped(&mut b, b"defg", 5)); // only "de" fits
+        assert!(push_capped(&mut b, b"h", 5)); // full: later small chunks never sneak in
+        assert_eq!(b, b"abcde");
+    }
 
     #[test]
     fn quotes_single_quotes() {

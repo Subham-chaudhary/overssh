@@ -28,6 +28,8 @@ const DEFAULT_PER_FILE: u32 = 500;
 const BATCH_SIZE: usize = 200;
 const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_TEXT_CHARS: usize = 400;
+/// Bytes of one output line kept for parsing (path + line number + text head).
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".git",
@@ -103,6 +105,10 @@ fn split_globs(s: &str) -> Vec<String> {
 pub fn build_command(req: &SearchRequest) -> Result<String, AppError> {
     if req.query.is_empty() {
         return Err(AppError::config("empty search query"));
+    }
+    // A NUL cannot travel inside a shell word (the exec request would be cut).
+    if [&req.query, &req.root, &req.include, &req.exclude].iter().any(|s| s.contains('\0')) {
+        return Err(AppError::config("search fields must not contain NUL characters"));
     }
     if req.root.is_empty() || !req.root.starts_with('/') {
         return Err(AppError::config("search root must be an absolute path"));
@@ -203,13 +209,15 @@ pub fn parse_line(root: &str, line: &[u8]) -> Option<SearchMatch> {
 pub struct Parser {
     root: String,
     carry: Vec<u8>,
+    /// The current line already hit `MAX_LINE_BYTES`: ignore bytes until `\n`.
+    skipping: bool,
     seen_marker: bool,
     pub engine: Option<String>,
 }
 
 impl Parser {
     pub fn new(root: &str) -> Self {
-        Self { root: root.to_string(), carry: Vec::new(), seen_marker: false, engine: None }
+        Self { root: root.to_string(), carry: Vec::new(), skipping: false, seen_marker: false, engine: None }
     }
 
     fn handle(&mut self, mut line: Vec<u8>, out: &mut Vec<SearchMatch>) {
@@ -233,12 +241,24 @@ impl Parser {
         for (i, b) in chunk.iter().enumerate() {
             if *b == b'\n' {
                 let mut line = std::mem::take(&mut self.carry);
-                line.extend_from_slice(&chunk[start..i]);
+                if !self.skipping {
+                    line.extend_from_slice(&chunk[start..i]);
+                }
+                self.skipping = false;
                 self.handle(line, out);
                 start = i + 1;
             }
         }
-        self.carry.extend_from_slice(&chunk[start..]);
+        if !self.skipping {
+            self.carry.extend_from_slice(&chunk[start..]);
+        }
+        // One huge line (minified bundle, data file) must not be buffered
+        // whole: keep its head (the match text is clipped anyway) and drop
+        // the rest up to the next newline.
+        if self.carry.len() > MAX_LINE_BYTES {
+            self.carry.truncate(MAX_LINE_BYTES);
+            self.skipping = true;
+        }
     }
 
     pub fn finish(&mut self, out: &mut Vec<SearchMatch>) {
@@ -448,6 +468,30 @@ mod tests {
         let (m, _) = parse_all(&[b"##grep\n./f\x003:\xff\n", &long]);
         assert_eq!(m[0].text, "\u{FFFD}");
         assert!(m[1].text.chars().count() <= MAX_TEXT_CHARS + 1);
+    }
+
+    #[test]
+    fn huge_line_is_bounded_and_next_line_still_parses() {
+        let mut p = Parser::new("/srv/app");
+        let mut out = Vec::new();
+        p.push(b"##rg\n./big\x001:", &mut out);
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..20 {
+            p.push(&chunk, &mut out);
+            assert!(p.carry.len() <= MAX_LINE_BYTES);
+        }
+        p.push(b"tail\n./b\x002:ok\n", &mut out);
+        p.finish(&mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "/srv/app/big");
+        assert_eq!(out[1].text, "ok");
+    }
+
+    #[test]
+    fn nul_is_rejected() {
+        let mut r = req();
+        r.query = "a\0b".into();
+        assert!(build_command(&r).is_err());
     }
 
     #[test]

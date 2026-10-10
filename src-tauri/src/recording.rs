@@ -358,7 +358,9 @@ fn info_for(path: &Path) -> Option<RecInfo> {
     let mut first = String::new();
     {
         use std::io::BufRead;
-        std::io::BufReader::new(&mut f).read_line(&mut first).ok()?;
+        // Bounded: a damaged/foreign `.cast` without newlines must not be
+        // read whole into memory just to list it.
+        std::io::BufReader::new((&mut f).take(64 * 1024)).read_line(&mut first).ok()?;
     }
     let header: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
     let started_at = header

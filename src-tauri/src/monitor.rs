@@ -198,7 +198,10 @@ pub struct CpuTimes {
 
 impl CpuTimes {
     fn total(&self) -> u64 {
-        self.user + self.nice + self.system + self.idle + self.iowait + self.irq + self.softirq + self.steal
+        // Saturating: garbage from a broken /proc must not overflow-panic.
+        [self.user, self.nice, self.system, self.idle, self.iowait, self.irq, self.softirq, self.steal]
+            .iter()
+            .fold(0u64, |a, b| a.saturating_add(*b))
     }
 }
 
@@ -235,7 +238,8 @@ pub fn cpu_usage(prev: &CpuTimes, cur: &CpuTimes) -> CpuUsage {
     let p = |a: u64, b: u64| a.saturating_sub(b) as f64 * 100.0 / dt as f64;
     let user = p(cur.user, prev.user);
     let nice = p(cur.nice, prev.nice);
-    let system = p(cur.system + cur.irq + cur.softirq, prev.system + prev.irq + prev.softirq);
+    let sys = |c: &CpuTimes| c.system.saturating_add(c.irq).saturating_add(c.softirq);
+    let system = p(sys(cur), sys(prev));
     let iowait = p(cur.iowait, prev.iowait);
     let steal = p(cur.steal, prev.steal);
     CpuUsage { user, nice, system, iowait, steal, total: (user + nice + system + iowait + steal).min(100.0) }
@@ -246,16 +250,17 @@ pub fn parse_meminfo(text: &str) -> MemInfo {
     for line in text.lines() {
         if let Some((k, v)) = line.split_once(':') {
             let n = v.split_whitespace().next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
-            m.insert(k.trim(), n * 1024);
+            m.insert(k.trim(), n.saturating_mul(1024));
         }
     }
     let g = |k: &str| m.get(k).copied().unwrap_or(0);
     let total = g("MemTotal");
     let free = g("MemFree");
     let buffers = g("Buffers");
-    let cache = (g("Cached") + g("SReclaimable")).saturating_sub(g("Shmem"));
+    let cache = g("Cached").saturating_add(g("SReclaimable")).saturating_sub(g("Shmem"));
     let used = total.saturating_sub(free).saturating_sub(buffers).saturating_sub(cache);
-    let available = if m.contains_key("MemAvailable") { g("MemAvailable") } else { free + buffers + cache };
+    let available =
+        if m.contains_key("MemAvailable") { g("MemAvailable") } else { free.saturating_add(buffers).saturating_add(cache) };
     MemInfo {
         total,
         used,
@@ -319,13 +324,13 @@ pub fn parse_df(text: &str) -> Vec<DiskUsage> {
         if mount.starts_with("/snap") || mount.starts_with("/proc") || mount.starts_with("/sys") {
             continue;
         }
-        let percent = used as f64 * 100.0 / (used + avail).max(1) as f64;
+        let percent = used as f64 * 100.0 / used.saturating_add(avail).max(1) as f64;
         out.push(DiskUsage {
             filesystem: t[0].to_string(),
             mount,
-            total: total * 1024,
-            used: used * 1024,
-            avail: avail * 1024,
+            total: total.saturating_mul(1024),
+            used: used.saturating_mul(1024),
+            avail: avail.saturating_mul(1024),
             percent,
         });
     }
@@ -366,7 +371,7 @@ pub fn parse_proc_stat_line(line: &str) -> Option<RawProc> {
         comm,
         state: f[0].to_string(),
         ppid: n(1).max(0) as u32,
-        ticks: (n(11) + n(12)).max(0) as u64,
+        ticks: n(11).saturating_add(n(12)).max(0) as u64,
         pri: n(15) as i32,
         ni: n(16) as i32,
         threads: n(17).max(0) as u32,
@@ -788,17 +793,24 @@ async fn run_exec(session: &Session, cmd: String) -> Result<(), AppError> {
     let _ = channel.eof().await;
     let mut out = String::new();
     let mut code: Option<u32> = None;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                if out.len() < 4096 {
-                    out.push_str(&String::from_utf8_lossy(&data));
+    let read = async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    if out.len() < 4096 {
+                        out.push_str(&String::from_utf8_lossy(&data));
+                    }
                 }
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                ChannelMsg::Close => break,
+                _ => {}
             }
-            ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-            ChannelMsg::Close => break,
-            _ => {}
         }
+    };
+    // kill/renice return at once; a hung channel must not hang the UI action.
+    if tokio::time::timeout(std::time::Duration::from_secs(30), read).await.is_err() {
+        let _ = channel.close().await;
+        return Err(AppError::Io { message: "command timed out".into() });
     }
     match code {
         Some(0) => Ok(()),
@@ -941,8 +953,8 @@ pub fn parse_details(pid: u32, text: &str) -> ProcDetails {
             "Threads" => d.threads = num() as u32,
             "PPid" => d.ppid = num() as u32,
             "Uid" => d.uid = v.split_whitespace().next().unwrap_or("").to_string(),
-            "VmPeak" => d.vm_peak = num() * 1024,
-            "VmSwap" => d.vm_swap = num() * 1024,
+            "VmPeak" => d.vm_peak = num().saturating_mul(1024),
+            "VmSwap" => d.vm_swap = num().saturating_mul(1024),
             "voluntary_ctxt_switches" => d.ctx_voluntary = num(),
             "nonvoluntary_ctxt_switches" => d.ctx_nonvoluntary = num(),
             _ => {}

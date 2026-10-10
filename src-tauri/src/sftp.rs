@@ -8,6 +8,7 @@ use russh::ChannelMsg;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -239,6 +240,9 @@ fi
 
 const LINE_COUNT_MAX_SIZE: u64 = 20 * 1024 * 1024;
 const EXEC_OUT_CAP: usize = 64 * 1024;
+/// stderr kept from `cp` / `sudo` (a failing `cp -a` of a big tree can print
+/// one line per file).
+const STDERR_CAP: usize = 16 * 1024;
 
 /// Runs `sh -c <script> sh <args…>` on a fresh exec channel. Returns stdout and
 /// the exit status. Fails only if the channel itself cannot be used.
@@ -246,6 +250,7 @@ async fn exec_sh(
     session: &Session,
     script: &str,
     args: &[&str],
+    timeout: Duration,
 ) -> Result<(String, Option<u32>), AppError> {
     let mut cmd = format!("sh -c {} sh", shell_quote(script));
     for a in args {
@@ -260,17 +265,21 @@ async fn exec_sh(
     let _ = channel.eof().await;
     let mut out: Vec<u8> = Vec::new();
     let mut code = None;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } => {
-                if out.len() < EXEC_OUT_CAP {
-                    out.extend_from_slice(&data);
+    let read = async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    crate::git::push_capped(&mut out, &data, EXEC_OUT_CAP);
                 }
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                ChannelMsg::Close => break,
+                _ => {}
             }
-            ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-            ChannelMsg::Close => break,
-            _ => {}
         }
+    };
+    if tokio::time::timeout(timeout, read).await.is_err() {
+        let _ = channel.close().await;
+        return Err(AppError::Io { message: "the server did not answer in time".into() });
     }
     Ok((String::from_utf8_lossy(&out).into_owned(), code))
 }
@@ -291,7 +300,7 @@ pub async fn file_info(session: &Session, path: &str) -> Result<FileInfo, AppErr
     let is_file = kind == FileKind::File
         || (kind == FileKind::Symlink && link_target_kind == Some(FileKind::File));
     let want_lines = if is_file && size <= LINE_COUNT_MAX_SIZE { "1" } else { "0" };
-    let exec = match exec_sh(session, INFO_SCRIPT, &[path, want_lines]).await {
+    let exec = match exec_sh(session, INFO_SCRIPT, &[path, want_lines], Duration::from_secs(20)).await {
         Ok((out, _)) => parse_exec_info(&out),
         Err(_) => ExecInfo::default(),
     };
@@ -373,7 +382,8 @@ fn parse_dir_size(out: &str, code: Option<u32>) -> Option<DirSize> {
 
 /// On-demand folder size (`du`) and file/folder counts (`find`) over an exec channel.
 pub async fn dir_size(session: &Session, path: &str) -> Result<DirSize, AppError> {
-    let (out, code) = exec_sh(session, DU_SCRIPT, &[path]).await?;
+    // DU_SCRIPT bounds each tool with `timeout 120` where available.
+    let (out, code) = exec_sh(session, DU_SCRIPT, &[path], Duration::from_secs(400)).await?;
     parse_dir_size(&out, code).ok_or_else(|| AppError::Other {
         message: "could not calculate the folder size on the server".to_string(),
     })
@@ -381,6 +391,12 @@ pub async fn dir_size(session: &Session, path: &str) -> Result<DirSize, AppError
 
 pub async fn read_file(session: &Session, path: &str) -> Result<FileContent, AppError> {
     let meta = session.sftp.metadata(path).await?;
+    match meta.file_type() {
+        FileType::File => {}
+        FileType::Dir => return Err(AppError::config(format!("{path} is a folder"))),
+        // FIFOs / devices: reading could block forever or never end (/dev/zero).
+        _ => return Err(AppError::config(format!("{path} is not a regular file"))),
+    }
     let size = meta.size.unwrap_or(0);
     if size > MAX_FILE_SIZE {
         return Err(AppError::TooLarge {
@@ -390,15 +406,28 @@ pub async fn read_file(session: &Session, path: &str) -> Result<FileContent, App
 
     let mut file = session.sftp.open(path).await?;
     let mut buffer = Vec::with_capacity(size as usize);
-    let mut chunk = [0u8; CHUNK_SIZE];
+    let mut chunk = vec![0u8; CHUNK_SIZE];
     loop {
-        let n = file.read(&mut chunk).await.map_err(|e| AppError::Io { message: e.to_string() })?;
+        let n = match file.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = file.close().await;
+                return Err(AppError::Io { message: e.to_string() });
+            }
+        };
         if n == 0 {
             break;
+        }
+        // The size from `stat` can be stale (a growing log) or 0 (/proc
+        // files): never buffer more than the limit, whatever stat said.
+        if buffer.len() + n > MAX_FILE_SIZE as usize {
+            let _ = file.close().await;
+            return Err(AppError::TooLarge { message: format!("{path} is over the 10 MB limit") });
         }
         buffer.extend_from_slice(&chunk[..n]);
     }
     let _ = file.close().await;
+    let size = buffer.len() as u64;
 
     let is_binary = buffer.iter().take(BINARY_SNIFF_LEN).any(|&b| b == 0);
     let content = String::from_utf8_lossy(&buffer).into_owned();
@@ -439,16 +468,30 @@ pub async fn write_file(
         .open_with_flags(path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
         .await?;
 
+    // The file is truncated from here on: a failure part-way (disk full, quota,
+    // link drop) says so, so the user keeps the editor buffer open.
+    let partial = |e: std::io::Error| AppError::Io {
+        message: format!("Saving {path} failed part-way; the file on the server may be incomplete: {e}"),
+    };
     for piece in content.as_bytes().chunks(CHUNK_SIZE) {
-        file.write_all(piece).await.map_err(|e| AppError::Io { message: e.to_string() })?;
+        if let Err(e) = file.write_all(piece).await {
+            let _ = file.close().await;
+            return Err(partial(e));
+        }
     }
-    let _ = file.flush().await;
+    if let Err(e) = file.flush().await {
+        let _ = file.close().await;
+        return Err(partial(e));
+    }
     file.close().await.map_err(|e| AppError::Io { message: e.to_string() })?;
 
+    // Truncating an existing file already keeps its mode; this only helps odd
+    // servers. chmod needs ownership, which the editor of a group-writable file
+    // may not have, and the content is saved by now: never fail the save here.
     if let Some(mode) = permissions {
         let mut attrs = FileAttributes::empty();
-        attrs.permissions = Some(mode);
-        session.sftp.set_metadata(path, attrs).await?;
+        attrs.permissions = Some(mode & 0o7777);
+        let _ = session.sftp.set_metadata(path, attrs).await;
     }
 
     let new_meta = session.sftp.metadata(path).await?;
@@ -539,7 +582,9 @@ async fn cp_via_exec(session: &Session, from: &str, to: &str) -> Result<(), CpFa
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::ExtendedData { data, ext: 1 } => {
-                stderr.push_str(&String::from_utf8_lossy(&data));
+                if stderr.len() < STDERR_CAP {
+                    stderr.push_str(&String::from_utf8_lossy(&data));
+                }
             }
             ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
             ChannelMsg::Close => break,
@@ -741,7 +786,9 @@ async fn sudo_move(
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::ExtendedData { data, ext: 1 } => {
-                stderr.push_str(&String::from_utf8_lossy(&data));
+                if stderr.len() < STDERR_CAP {
+                    stderr.push_str(&String::from_utf8_lossy(&data));
+                }
             }
             ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
             ChannelMsg::Close => break,

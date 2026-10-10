@@ -160,6 +160,14 @@ where
     stats.active.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// How long a new tunnelled connection may take to open (server `direct-tcpip`
+/// answer for -L/-D, local connect for -R) before it is given up.
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the server may take to answer a `tcpip-forward` (-R) request.
+const REMOTE_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
+/// Consecutive `accept()` errors after which a listener is considered dead.
+const MAX_ACCEPT_ERRORS: u32 = 50;
+
 // ---------------------------------------------------------------------------
 // -R routing (shared with ClientHandler)
 // ---------------------------------------------------------------------------
@@ -202,7 +210,12 @@ pub async fn accept_remote(
         return;
     };
     tokio::spawn(async move {
-        match TcpStream::connect((route.target_host.as_str(), route.target_port)).await {
+        let connect = TcpStream::connect((route.target_host.as_str(), route.target_port));
+        let connected = match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, connect).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")),
+        };
+        match connected {
             Ok(local) => {
                 reply.accept().await;
                 pump(local, channel.into_stream(), route.stats.clone()).await;
@@ -630,11 +643,13 @@ async fn start(
             let task_mgr = mgr.clone();
             let task_id = id.clone();
             tokio::spawn(async move {
+                let mut accept_errors = 0u32;
                 loop {
                     tokio::select! {
                         _ = stop_rx.changed() => break,
                         accepted = listener.accept() => match accepted {
                             Ok((socket, peer)) => {
+                                accept_errors = 0;
                                 let s = task_session.clone();
                                 let st = task_stats.clone();
                                 let host = target_host.clone();
@@ -657,15 +672,20 @@ async fn start(
                                     } else {
                                         (host, target_port, None)
                                     };
-                                    match s
-                                        .open_direct_tcpip(
-                                            &host,
-                                            port as u32,
-                                            &peer.ip().to_string(),
-                                            peer.port() as u32,
-                                        )
-                                        .await
-                                    {
+                                    let peer_ip = peer.ip().to_string();
+                                    let open = s.open_direct_tcpip(
+                                        &host,
+                                        port as u32,
+                                        &peer_ip,
+                                        peer.port() as u32,
+                                    );
+                                    // A server that never answers must not pin this task
+                                    // (and the client socket) forever.
+                                    let opened = match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, open).await {
+                                        Ok(r) => r,
+                                        Err(_) => Err(AppError::Connection { message: "timed out".into() }),
+                                    };
+                                    match opened {
                                         Ok(channel) => {
                                             if let Some(v) = socks_version {
                                                 if socks::write_reply(&mut socket, v, true).await.is_err() {
@@ -684,6 +704,13 @@ async fn start(
                                         }
                                     }
                                 });
+                            }
+                            Err(e) if accept_errors < MAX_ACCEPT_ERRORS => {
+                                // Usually transient (a client reset before accept,
+                                // out of file handles): keep listening, back off a bit.
+                                accept_errors += 1;
+                                task_stats.set_error(format!("Accept failed: {e}"));
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                             Err(e) => {
                                 // Listener died: drop the rule and tell the UI.
@@ -716,7 +743,13 @@ async fn start(
                 .lock()
                 .map_err(|_| AppError::other("route table poisoned"))?
                 .push(route);
-            let granted = match session.tcpip_forward(&addr, spec.bind_port as u32).await {
+            let asked = tokio::time::timeout(
+                REMOTE_FORWARD_TIMEOUT,
+                session.tcpip_forward(&addr, spec.bind_port as u32),
+            )
+            .await
+            .unwrap_or_else(|_| Err(AppError::Connection { message: "the server did not answer".into() }));
+            let granted = match asked {
                 Ok(p) => p,
                 Err(e) => {
                     if let Ok(mut r) = session.routes.lock() {
@@ -730,7 +763,7 @@ async fn start(
                     });
                 }
             };
-            let port = if spec.bind_port == 0 { granted as u16 } else { spec.bind_port };
+            let port = if spec.bind_port == 0 { u16::try_from(granted).unwrap_or(0) } else { spec.bind_port };
             if let Ok(mut r) = session.routes.lock() {
                 if let Some(route) = r.iter_mut().find(|r| r.forward_id == id) {
                     route.port = port as u32;
@@ -753,8 +786,18 @@ async fn start(
         stop: stop_tx,
     });
     let info = entry.info();
-    mgr.entries.write().await.insert(id, entry);
+    let session_id = entry.session.id.clone();
+    mgr.entries.write().await.insert(id.clone(), entry);
     mgr.running.fetch_add(1, Ordering::Relaxed);
+    // The connection may have dropped while we were binding; its cleanup ran
+    // before this entry existed, so stop the orphan here.
+    use tauri::Manager;
+    if let Some(sessions) = app.try_state::<SessionManager>() {
+        if sessions.get(&session_id).await.is_err() {
+            mgr.stop_one(app, &id).await;
+            return Err(AppError::Connection { message: "The session closed while the forward was starting".into() });
+        }
+    }
     crate::tray::refresh(app, mgr).await;
     Ok(info)
 }

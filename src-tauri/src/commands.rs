@@ -36,23 +36,52 @@ pub async fn connect(
 }
 
 #[tauri::command]
-pub async fn disconnect(
-    app: AppHandle,
-    manager: State<'_, SessionManager>,
-    terminals: State<'_, TerminalManager>,
-    forwards: State<'_, crate::forward::ForwardManager>,
-    logs: State<'_, crate::logs::LogManager>,
-    transfers: State<'_, TransferManager>,
-    session_id: String,
-) -> Result<(), AppError> {
-    terminals.close_for_session(&session_id).await;
-    logs.close_for_session(&session_id).await;
-    transfers.cancel_for_session(&session_id);
-    forwards.stop_for_session(&app, &session_id).await;
-    if let Some(session) = manager.remove(&session_id).await {
-        session.close().await;
-    }
+pub async fn disconnect(app: AppHandle, session_id: String) -> Result<(), AppError> {
+    cleanup_session(&app, &session_id, None).await;
     Ok(())
+}
+
+/// Tears down everything bound to `session_id` and closes the connection.
+/// Idempotent: used by `disconnect` and, when the link drops unexpectedly, by
+/// `ClientHandler::disconnected`, so no manager keeps tasks, channels or
+/// listeners (or emits events) for a session that no longer exists.
+///
+/// `lost` is the reason when the connection dropped by itself (then running
+/// transfers end with that error rather than as "cancelled").
+pub async fn cleanup_session(app: &AppHandle, session_id: &str, lost: Option<&str>) {
+    use tauri::Manager;
+    // Remove the session first so nothing new can start on it meanwhile.
+    let session = match app.try_state::<SessionManager>() {
+        Some(m) => m.remove(session_id).await,
+        None => None,
+    };
+    if lost.is_some() && session.is_none() {
+        // A deliberate `disconnect` already cleaned up (its own close is what
+        // ended the connection), or the session never finished connecting.
+        return;
+    }
+    if let Some(t) = app.try_state::<TerminalManager>() {
+        t.close_for_session(session_id).await;
+    }
+    if let Some(l) = app.try_state::<crate::logs::LogManager>() {
+        l.close_for_session(session_id).await;
+    }
+    if let Some(d) = app.try_state::<crate::docker::DockerManager>() {
+        d.close_for_session(session_id).await;
+    }
+    // The monitor loop is not stopped here: it ends by itself when the
+    // connection closes and then emits `monitor://closed`, which the
+    // frontend's monitor store relies on.
+    if let Some(tr) = app.try_state::<TransferManager>() {
+        tr.cancel_for_session(session_id, lost);
+    }
+    if let Some(f) = app.try_state::<crate::forward::ForwardManager>() {
+        f.inner().clone().stop_for_session(app, session_id).await;
+    }
+    if let Some(session) = session {
+        // A dead link may never answer; don't hang the caller on it.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session.close()).await;
+    }
 }
 
 #[tauri::command]

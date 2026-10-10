@@ -171,7 +171,10 @@ impl TerminalManager {
                 .collect()
         };
         for id in ids {
-            if let Some(handle) = self.terminals.write().await.remove(&id) {
+            // Bind first: the map's write lock must not be held across the
+            // channel awaits below.
+            let removed = self.terminals.write().await.remove(&id);
+            if let Some(handle) = removed {
                 recording::finish(&handle.rec);
                 let _ = handle.write.eof().await;
                 let _ = handle.write.close().await;
@@ -365,7 +368,8 @@ pub async fn term_window_open(
     )
     .title("OverSSH \u{2014} Terminals")
     .inner_size(width, height)
-    .min_inner_size(480.0, 280.0);
+    .min_inner_size(480.0, 280.0)
+    .decorations(false); // custom title bar (§15.3.T)
     if let (Some(x), Some(y)) = (g.x, g.y) {
         // Ignore wild values (e.g. a monitor that is no longer attached).
         if x > -4000.0 && x < 8000.0 && y > -200.0 && y < 5000.0 {
@@ -441,31 +445,37 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 /// "utf-8 (lossy)" contract in docs/GUIDE.md §5.1.
 fn decode_utf8_lossy_carry(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     carry.extend_from_slice(chunk);
-    match std::str::from_utf8(carry) {
-        Ok(s) => {
-            let out = s.to_string();
-            carry.clear();
-            out
-        }
-        Err(e) => {
-            let valid_up_to = e.valid_up_to();
-            let valid = std::str::from_utf8(&carry[..valid_up_to])
-                .unwrap_or_default()
-                .to_string();
-            let rest = carry[valid_up_to..].to_vec();
-            if e.error_len().is_none() && rest.len() <= 3 {
-                // Incomplete sequence at the end of the chunk (up to 3 bytes
-                // of a 4-byte codepoint) — hold it for the next chunk.
-                *carry = rest;
-                valid
-            } else {
-                // Genuinely invalid bytes (not just truncated) — replace them.
-                let lossy = String::from_utf8_lossy(&rest).into_owned();
-                carry.clear();
-                valid + &lossy
+    let buf = std::mem::take(carry);
+    let mut out = String::with_capacity(buf.len());
+    let mut rest: &[u8] = &buf;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                // `from_utf8` just validated this prefix.
+                out.push_str(std::str::from_utf8(&rest[..valid_up_to]).unwrap_or_default());
+                match e.error_len() {
+                    // Genuinely invalid bytes: replace them and keep decoding
+                    // (a split char later in the same chunk is still held back).
+                    Some(n) => {
+                        out.push('\u{FFFD}');
+                        rest = &rest[valid_up_to + n..];
+                    }
+                    // Incomplete sequence at the very end (at most 3 bytes of a
+                    // 4-byte codepoint): hold it for the next chunk.
+                    None => {
+                        carry.extend_from_slice(&rest[valid_up_to..]);
+                        break;
+                    }
+                }
             }
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -543,6 +553,15 @@ mod tests {
         let out = decode_utf8_lossy_carry(&mut carry, &[0xff, b'a']);
         assert_eq!(out, "\u{FFFD}a");
         assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn invalid_byte_then_split_char_keeps_the_split_char() {
+        let mut carry = Vec::new();
+        let out = decode_utf8_lossy_carry(&mut carry, &[0xff, b'a', 0xe2, 0x82]);
+        assert_eq!(out, "\u{FFFD}a");
+        assert_eq!(carry, vec![0xe2, 0x82]);
+        assert_eq!(decode_utf8_lossy_carry(&mut carry, &[0xac]), "\u{20ac}");
     }
 
     #[test]
