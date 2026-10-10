@@ -39,6 +39,7 @@
   import FolderRootIcon from "@lucide/svelte/icons/folder-input";
   import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
   import InfoIcon from "@lucide/svelte/icons/info";
+  import SquareSplitVerticalIcon from "@lucide/svelte/icons/square-split-vertical";
 
   let {
     sessionId,
@@ -46,6 +47,7 @@
     y,
     dirPath,
     entry,
+    pane,
     onClose,
     onInfo,
   }: {
@@ -54,6 +56,8 @@
     y: number;
     dirPath: string;
     entry: FileEntry | null;
+    /** Explorer pane the menu was opened in (§15.3.S); omitted = the focused pane. */
+    pane?: number;
     onClose: () => void;
     /** Opens the Info (Properties) dialog for these paths (mounted by Explorer). */
     onInfo?: (paths: string[]) => void;
@@ -98,20 +102,20 @@
   async function doDelete(): Promise<void> {
     const s = close();
     if (!s.entry) return;
-    await deleteEntries(s.sessionId, selectedPaths(s.sessionId, s.entry.path));
+    await deleteEntries(s.sessionId, selectedPaths(s.sessionId, s.entry.path, pane));
   }
 
   function doCopyFiles(op: "copy" | "cut"): void {
     const s = close();
     if (!s.entry) return;
-    copyToClipboard(s.sessionId, selectedPaths(s.sessionId, s.entry.path), op);
+    copyToClipboard(s.sessionId, selectedPaths(s.sessionId, s.entry.path, pane), op);
   }
 
   async function doPaste(): Promise<void> {
     if (!canPaste(sessionId)) return;
     const dir = newTargetDir();
     const s = close();
-    await pasteClipboard(s.sessionId, dir);
+    await pasteClipboard(s.sessionId, dir, pane);
   }
 
   async function doUndo(): Promise<void> {
@@ -127,7 +131,7 @@
   async function doDuplicate(): Promise<void> {
     const s = close();
     if (!s.entry) return;
-    for (const p of selectedPaths(s.sessionId, s.entry.path)) await duplicateEntry(s.sessionId, p);
+    for (const p of selectedPaths(s.sessionId, s.entry.path, pane)) await duplicateEntry(s.sessionId, p);
   }
 
   function doRefresh(): void {
@@ -136,26 +140,33 @@
   }
 
   /** The explorer's current root, which "Go Up" moves one level above. */
-  const cwd = $derived(app.workspaces[sessionId]?.explorer.cwd ?? dirPath);
+  const cwd = $derived(app.paneState(sessionId, pane)?.cwd ?? dirPath);
   const canGoUp = $derived(!isRoot(cwd));
 
   /** "Set as Explorer Root": like `cd` into the folder (single folder row only). */
   function setAsRoot(): void {
     const s = close();
     if (!s.entry) return;
-    void app.navigateExplorer(s.sessionId, s.entry.path);
+    void app.navigateExplorer(s.sessionId, s.entry.path, pane);
+  }
+
+  /** "Open in Other Pane": roots the other Explorer pane at this folder (splits first if needed). */
+  function openInOtherPane(): void {
+    const s = close();
+    if (!s.entry) return;
+    void app.openInOtherPane(s.sessionId, s.entry.path, pane);
   }
 
   /** "Go Up": like `cd ..` for the explorer root. */
   function goUp(): void {
     const target = dirname(cwd);
     const s = close();
-    void app.navigateExplorer(s.sessionId, target);
+    void app.navigateExplorer(s.sessionId, target, pane);
   }
 
   function showInfo(): void {
     const s = close();
-    const paths = s.entry ? selectedPaths(s.sessionId, s.entry.path) : [s.dirPath];
+    const paths = s.entry ? selectedPaths(s.sessionId, s.entry.path, pane) : [s.dirPath];
     onInfo?.(paths);
   }
 
@@ -186,7 +197,7 @@
   async function doDownload(): Promise<void> {
     if (!entry) return;
     const s = close();
-    const paths = selectedPaths(s.sessionId, s.entry!.path);
+    const paths = selectedPaths(s.sessionId, s.entry!.path, pane);
     const single = paths.length === 1 && s.entry!.kind === "file";
     try {
       if (single) {
@@ -372,6 +383,13 @@
       role="menuitem"
       class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
       onclick={setAsRoot}><FolderRootIcon class="size-3.5" /> Set as Explorer Root</button
+    >
+    <button
+      type="button"
+      role="menuitem"
+      class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
+      data-testid="ctx-open-other-pane"
+      onclick={openInOtherPane}><SquareSplitVerticalIcon class="size-3.5" /> Open in Other Pane</button
     >
   {/if}
   {#if canGoUp}

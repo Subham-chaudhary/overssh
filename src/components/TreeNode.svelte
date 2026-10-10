@@ -11,6 +11,7 @@
   let {
     entry,
     sessionId,
+    pane = 0,
     depth,
     parentDir,
     onOpenFile,
@@ -18,6 +19,8 @@
   }: {
     entry: FileEntry;
     sessionId: string;
+    /** Explorer pane (§15.3.S) whose expand/selection state this row shows. */
+    pane?: number;
     depth: number;
     parentDir: string;
     onOpenFile: (path: string) => void;
@@ -27,13 +30,13 @@
   // Expand/selection/children state lives in the store (ExplorerState), keyed
   // by path, so a mutation only needs to refresh the affected node — see
   // `app.refreshDir` — instead of collapsing/rebuilding the whole tree.
-  const ex = $derived(app.workspaces[sessionId]?.explorer);
+  const ex = $derived(app.paneState(sessionId, pane));
   const isDir = $derived(
     entry.kind === "dir" || (entry.kind === "symlink" && entry.linkTargetIsDir === true),
   );
   const expanded = $derived(ex?.expanded.has(entry.path) ?? false);
   const node = $derived(ex?.children[entry.path]);
-  const selected = $derived(isRowSelected(sessionId, entry.path));
+  const selected = $derived(isRowSelected(sessionId, entry.path, pane));
   const cut = $derived(isCut(sessionId, entry.path));
   const isDropTarget = $derived(isDir && ex?.dropTarget === entry.path);
   const visibleChildren = $derived(
@@ -41,14 +44,14 @@
   );
 
   function select(): void {
-    app.selectPath(sessionId, entry.path);
+    app.selectPath(sessionId, entry.path, pane);
   }
 
   function onClick(e?: MouseEvent): void {
-    if (e && modifierSelect(sessionId, entry.path, e)) return;
+    if (e && modifierSelect(sessionId, entry.path, e, pane)) return;
     select();
     if (isDir) {
-      void app.toggleExpandDir(sessionId, entry.path);
+      void app.toggleExpandDir(sessionId, entry.path, pane);
     } else {
       onOpenFile(entry.path);
     }
@@ -125,6 +128,7 @@
         <TreeNode
           entry={child}
           {sessionId}
+          {pane}
           depth={depth + 1}
           parentDir={entry.path}
           {onOpenFile}

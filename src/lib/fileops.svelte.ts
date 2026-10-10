@@ -8,7 +8,7 @@
 import * as api from "./api";
 import { isAppError } from "./api";
 import { app, type Tab } from "./stores.svelte";
-import { basename, dirname, join } from "./paths";
+import { basename, dirname, join, validateEntryName } from "./paths";
 import { languageName } from "./languages";
 import type { FileEntry } from "./types";
 
@@ -69,22 +69,26 @@ function copyName(name: string, n: number, isDir: boolean): string {
 
 /** Rows an action on `anchor` applies to: the whole multi-selection if `anchor`
  * is part of it, else just `anchor` (or the selected row when omitted). */
-export function selectedPaths(sessionId: string, anchor?: string | null): string[] {
-  const ex = app.workspaces[sessionId]?.explorer;
+export function selectedPaths(sessionId: string, anchor?: string | null, pane?: number): string[] {
+  const ex = app.paneState(sessionId, pane);
   if (!ex) return [];
   if (ex.multi.length > 1 && (anchor == null || ex.multi.includes(anchor))) return [...ex.multi];
   const one = anchor ?? ex.selected;
   return one ? [one] : [];
 }
 
-export function isRowSelected(sessionId: string, path: string): boolean {
-  const ex = app.workspaces[sessionId]?.explorer;
+export function isRowSelected(sessionId: string, path: string, pane?: number): boolean {
+  const ex = app.paneState(sessionId, pane);
   if (!ex) return false;
   return ex.selected === path || (ex.multi.length > 1 && ex.multi.includes(path));
 }
 
-function visibleRowPaths(): string[] {
-  return Array.from(document.querySelectorAll<HTMLElement>('[role="treeitem"][data-parent]'))
+function visibleRowPaths(pane?: number): string[] {
+  const scope =
+    pane === undefined
+      ? document
+      : (document.querySelector(`[data-explorer-pane="${pane}"]`) ?? document);
+  return Array.from(scope.querySelectorAll<HTMLElement>('[role="treeitem"][data-parent]'))
     .map((r) => r.getAttribute("data-path"))
     .filter((p): p is string => !!p);
 }
@@ -95,8 +99,9 @@ export function modifierSelect(
   sessionId: string,
   path: string,
   e: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean },
+  pane?: number,
 ): boolean {
-  const ex = app.workspaces[sessionId]?.explorer;
+  const ex = app.paneState(sessionId, pane);
   if (!ex) return false;
   if (e.ctrlKey || e.metaKey) {
     const set = new Set(ex.multi.length > 0 ? ex.multi : ex.selected ? [ex.selected] : []);
@@ -107,7 +112,7 @@ export function modifierSelect(
     return true;
   }
   if (e.shiftKey && ex.selected) {
-    const rows = visibleRowPaths();
+    const rows = visibleRowPaths(pane);
     const a = rows.indexOf(ex.selected);
     const b = rows.indexOf(path);
     if (a < 0 || b < 0) return false;
@@ -148,26 +153,28 @@ export function retargetPaths(sessionId: string, from: string, to: string): void
     if (moved) ws.activeTabId = moved.id;
   }
 
-  const ex = ws.explorer;
-  const wasExpanded = [...ex.expanded].filter((p) => remap(p, from, to) !== null);
-  for (const p of wasExpanded) {
-    ex.expanded.delete(p);
-    ex.expanded.add(remap(p, from, to)!);
+  for (const ex of ws.panes) {
+    const wasExpanded = [...ex.expanded].filter((p) => remap(p, from, to) !== null);
+    for (const p of wasExpanded) {
+      ex.expanded.delete(p);
+      ex.expanded.add(remap(p, from, to)!);
+    }
+    for (const key of Object.keys(ex.children)) {
+      if (remap(key, from, to) !== null) delete ex.children[key];
+    }
+    if (ex.selected) ex.selected = remap(ex.selected, from, to) ?? ex.selected;
+    ex.multi = ex.multi.map((p) => remap(p, from, to) ?? p);
+    const cwd = remap(ex.cwd, from, to);
+    if (cwd !== null) ex.cwd = cwd;
   }
-  for (const key of Object.keys(ex.children)) {
-    if (remap(key, from, to) !== null) delete ex.children[key];
-  }
-  if (ex.selected) ex.selected = remap(ex.selected, from, to) ?? ex.selected;
-  ex.multi = ex.multi.map((p) => remap(p, from, to) ?? p);
-  const cwd = remap(ex.cwd, from, to);
-  if (cwd !== null) ex.cwd = cwd;
 }
 
 /** Reloads every renamed-away-and-back expanded directory under `to`. */
 async function reloadExpandedUnder(sessionId: string, to: string): Promise<void> {
-  const ex = app.workspaces[sessionId]?.explorer;
-  if (!ex) return;
-  for (const dir of [...ex.expanded].filter((p) => isInside(to, p))) {
+  const ws = app.workspaces[sessionId];
+  if (!ws) return;
+  const dirs = new Set(ws.panes.flatMap((ex) => [...ex.expanded]).filter((p) => isInside(to, p)));
+  for (const dir of dirs) {
     await app.refreshDir(sessionId, dir);
   }
 }
@@ -182,11 +189,16 @@ async function handleDeleted(sessionId: string, path: string): Promise<void> {
     if (tab.doc !== tab.savedDoc) tab.missing = true;
     else await app.closeTab(tab.id);
   }
-  const ex = ws.explorer;
-  for (const p of [...ex.expanded]) if (isInside(path, p)) ex.expanded.delete(p);
-  for (const key of Object.keys(ex.children)) if (isInside(path, key)) delete ex.children[key];
-  if (ex.selected && isInside(path, ex.selected)) ex.selected = null;
-  ex.multi = ex.multi.filter((p) => !isInside(path, p));
+  for (const ex of ws.panes) {
+    for (const p of [...ex.expanded]) if (isInside(path, p)) ex.expanded.delete(p);
+    for (const key of Object.keys(ex.children)) if (isInside(path, key)) delete ex.children[key];
+    if (ex.selected && isInside(path, ex.selected)) ex.selected = null;
+    ex.multi = ex.multi.filter((p) => !isInside(path, p));
+  }
+  // A pane rooted at (or below) the deleted folder moves up to its parent.
+  await Promise.all(
+    ws.panes.map((ex, i) => (isInside(path, ex.cwd) ? app.navigateExplorer(sessionId, dirname(path), i) : undefined)),
+  );
 }
 
 // --- undo / redo ---------------------------------------------------------------
@@ -360,15 +372,17 @@ export async function renameEntry(sessionId: string, entry: FileEntry, parentDir
   const name = (
     await app.ask({
       title: "Rename",
-      input: { value: current, selectRange: [0, stemEnd] },
+      input: { value: current, selectRange: [0, stemEnd], validate: (v) => validateEntryName(v) },
       confirmLabel: "Rename",
     })
   )?.trim();
   if (!name || name === current) return;
-  if (name.includes("/")) {
-    app.addToast("error", "A file or folder name cannot contain '/'");
+  const bad = validateEntryName(name);
+  if (bad) {
+    app.addToast("error", bad);
     return;
   }
+  if (!app.workspaces[sessionId]) return; // disconnected while the dialog was open
   const to = join(parentDir, name);
   try {
     await api.rename(sessionId, entry.path, to);
@@ -474,7 +488,7 @@ export function canPaste(_sessionId: string): boolean {
   return fileClipboard.paths.length > 0 && fileClipboard.sessionId !== null;
 }
 
-export async function pasteClipboard(sessionId: string, destDir: string): Promise<void> {
+export async function pasteClipboard(sessionId: string, destDir: string, pane?: number): Promise<void> {
   if (fileClipboard.paths.length === 0) return;
   const paths = [...fileClipboard.paths];
   const op = fileClipboard.op;
@@ -492,7 +506,7 @@ export async function pasteClipboard(sessionId: string, destDir: string): Promis
     }
     return;
   }
-  await transferEntries(sessionId, paths, destDir, op === "cut" ? "move" : "copy");
+  await transferEntries(sessionId, paths, destDir, op === "cut" ? "move" : "copy", pane);
   if (op === "cut") {
     fileClipboard.paths = [];
     fileClipboard.sessionId = null;
@@ -511,8 +525,10 @@ export async function transferEntries(
   sources: string[],
   destDir: string,
   op: "move" | "copy",
+  /** Pane that shows the destination (expanded and selected afterwards); default: the focused one. */
+  pane?: number,
 ): Promise<void> {
-  const ex = app.workspaces[sessionId]?.explorer;
+  const ex = app.paneState(sessionId, pane);
   if (!ex) return;
   // Drop sources whose ancestor is also being transferred.
   const items = sources.filter((s) => !sources.some((o) => o !== s && isInside(o, s)));
@@ -579,11 +595,11 @@ export async function transferEntries(
     });
   }
   for (const dir of refresh) await app.refreshDir(sessionId, dir);
-  const cur = app.workspaces[sessionId]?.explorer;
-  if (cur && destDir !== cur.cwd && !cur.expanded.has(destDir)) await app.expandDir(sessionId, destDir);
+  const cur = app.paneState(sessionId, pane);
+  if (cur && destDir !== cur.cwd && !cur.expanded.has(destDir)) await app.expandDir(sessionId, destDir, pane);
   if (op === "move") for (const to of results) await reloadExpandedUnder(sessionId, to);
   if (cur && results.length > 0) {
-    if (results.length === 1) app.selectPath(sessionId, results[0]);
+    if (results.length === 1) app.selectPath(sessionId, results[0], pane);
     else {
       cur.selected = results[0];
       cur.multi = results;
