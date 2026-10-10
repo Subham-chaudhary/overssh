@@ -13,6 +13,7 @@
     removeJob,
     resolveConflict,
     retryJob,
+    sessionsReady,
     transfers,
   } from "../../lib/transfers.svelte";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
@@ -39,6 +40,7 @@
       case "cancelled":
         return "Cancelled";
       case "error":
+        if (j.connectionLost) return sessionsReady(j) ? "Connection was lost. Reconnected: Retry to resume." : "Connection was lost. Retry when the host is reconnected.";
         return j.error ?? "Failed";
     }
   }
@@ -80,9 +82,11 @@
                   {#if j.state !== "done"}
                     <button
                       type="button"
-                      class="rounded-sm p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      class="rounded-sm p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
                       aria-label="Retry transfer"
                       data-testid="transfer-retry"
+                      disabled={j.connectionLost && !sessionsReady(j)}
+                      title={j.connectionLost && !sessionsReady(j) ? "Waiting for the session to reconnect" : "Retry (files already copied are skipped)"}
                       onclick={() => void retryJob(j.id)}><RotateCwIcon class="size-3.5" /></button
                     >
                   {/if}

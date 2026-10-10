@@ -55,6 +55,7 @@ export class CronSession {
   }
 
   async load(): Promise<void> {
+    if (this.loading) return;
     this.loading = true;
     this.error = null;
     try {
@@ -71,10 +72,38 @@ export class CronSession {
   }
 
   async save(): Promise<boolean> {
+    if (this.saving) return false; // double click while writing
     if (this.rawMode) this.lines = parseCrontab(this.rawText);
     const text = serializeCrontab(this.lines);
+    // Lines that are neither jobs, comments nor VAR=value: crontab rejects the whole file on a bad one.
+    const bad: number[] = [];
+    this.lines.forEach((l, i) => {
+      if (l.kind === "unknown") bad.push(i + 1);
+    });
+    if (bad.length > 0) {
+      const ok = await app.ask({
+        title: "Save crontab",
+        message: `Line${bad.length === 1 ? "" : "s"} ${bad.slice(0, 8).join(", ")}${bad.length > 8 ? "…" : ""} ${bad.length === 1 ? "is not a valid cron job" : "are not valid cron jobs"} (expected 5 schedule fields or @special, then a command). crontab may refuse the file. Save anyway?`,
+        confirmLabel: "Save anyway",
+      });
+      if (!ok) return false;
+    }
     this.saving = true;
     try {
+      // Someone (or another OverSSH window) changed the crontab since it was loaded: do not overwrite silently.
+      const remote = await api.cronRead(this.sessionId).catch(() => null);
+      if (remote !== null && remote !== this.original && remote !== text) {
+        const ok = await app.ask({
+          title: "Crontab changed on the VM",
+          message: "The crontab was changed on the VM after it was loaded here. Saving replaces those changes with yours.",
+          confirmLabel: "Overwrite",
+          danger: true,
+        });
+        if (!ok) {
+          this.saving = false;
+          return false;
+        }
+      }
       await api.cronWrite(this.sessionId, text);
     } catch (e) {
       this.saving = false;
@@ -156,6 +185,7 @@ export class CronSession {
   }
 
   async loadSystem(): Promise<void> {
+    if (this.systemLoading) return;
     this.systemLoading = true;
     const out: SystemCron[] = [];
     const read = async (path: string) => {
@@ -169,7 +199,9 @@ export class CronSession {
     await read("/etc/crontab");
     try {
       const entries = await api.listDir(this.sessionId, "/etc/cron.d");
-      for (const e of entries) if (e.kind !== "dir" && !e.name.startsWith(".")) await read(e.path);
+      // Cap: a host with hundreds of files in /etc/cron.d would otherwise read them all one by one.
+      const files = entries.filter((e) => e.kind !== "dir" && !e.name.startsWith(".")).slice(0, 100);
+      for (const e of files) await read(e.path);
     } catch {
       /* no /etc/cron.d */
     }

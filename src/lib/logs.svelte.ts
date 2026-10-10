@@ -324,6 +324,8 @@ export class LogTab {
 const byStream = new Map<string, LogTab>();
 /** Events that arrive before `logs_open` has resolved with the stream id. */
 const orphans = new Map<string, string[][]>();
+/** Latest openLog() per tab id: an older open that resolves later is closed, not adopted. */
+const openSeq = new Map<string, number>();
 
 function adopt(tab: LogTab, streamId: string): void {
   tab.streamId = streamId;
@@ -391,6 +393,13 @@ export async function openLog(sessionId: string, spec: LogSourceSpec, existing?:
   const { host, label } = hostOf(sessionId);
   let tab = existing;
   if (tab) {
+    // Restarting a live tab: stop the old stream first, or both would feed it.
+    if (tab.streamId) {
+      byStream.delete(tab.streamId);
+      orphans.delete(tab.streamId);
+      void api.logsClose(tab.streamId).catch(() => {});
+      tab.streamId = null;
+    }
     tab.status = "connecting";
     tab.error = null;
     tab.endCode = null;
@@ -403,10 +412,19 @@ export async function openLog(sessionId: string, spec: LogSourceSpec, existing?:
   }
   logStore.activeId = tab.id;
   app.sidebarView = "logs";
+  const seq = (openSeq.get(tab.id) ?? 0) + 1;
+  openSeq.set(tab.id, seq);
   try {
     const id = await api.logsOpen(sessionId, send);
+    // Tab closed, or restarted again, while the stream was opening: do not leave it running unseen.
+    if (openSeq.get(tab.id) !== seq || !logStore.tabs.some((t) => t.id === tab.id)) {
+      orphans.delete(id);
+      void api.logsClose(id).catch(() => {});
+      return tab;
+    }
     adopt(tab, id);
   } catch (err) {
+    if (openSeq.get(tab.id) !== seq) return tab;
     tab.status = "error";
     tab.error = errMsg(err);
   }
@@ -417,8 +435,10 @@ export async function closeLog(id: string): Promise<void> {
   const i = logStore.tabs.findIndex((t) => t.id === id);
   if (i < 0) return;
   const tab = logStore.tabs[i];
+  openSeq.delete(id);
   if (tab.streamId) {
     byStream.delete(tab.streamId);
+    orphans.delete(tab.streamId);
     void api.logsClose(tab.streamId).catch(() => {});
   }
   logStore.tabs.splice(i, 1);
@@ -495,7 +515,8 @@ void api.onLogData(({ streamId, lines }) => {
   if (tab) tab.ingest(lines);
   else {
     const q = orphans.get(streamId) ?? [];
-    q.push(lines);
+    // Bounded: a closed stream can keep sending until its end event arrives.
+    if (q.length < 200) q.push(lines);
     orphans.set(streamId, q);
   }
 });

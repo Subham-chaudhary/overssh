@@ -123,9 +123,11 @@
           <DropdownMenu.Separator />
           <DropdownMenu.Item variant="destructive" data-testid="scm-abort-merge" onclick={() => void gitStore.abortMerge()}>Abort Merge</DropdownMenu.Item>
         {/if}
-        <DropdownMenu.Separator />
-        <DropdownMenu.Item onclick={() => void gitStore.rebaseControl("--continue")}>Continue Rebase</DropdownMenu.Item>
-        <DropdownMenu.Item onclick={() => void gitStore.rebaseControl("--abort")}>Abort Rebase</DropdownMenu.Item>
+        {#if !gitStore.operationKnown || gitStore.operation === "rebase"}
+          <DropdownMenu.Separator />
+          <DropdownMenu.Item onclick={() => void gitStore.rebaseControl("--continue")}>Continue Rebase</DropdownMenu.Item>
+          <DropdownMenu.Item onclick={() => void gitStore.rebaseControl("--abort")}>Abort Rebase</DropdownMenu.Item>
+        {/if}
         <DropdownMenu.Separator />
         <DropdownMenu.Item data-testid="scm-open-repository" onclick={() => void openRepository()}>Open Repository…</DropdownMenu.Item>
         {#if manual}

@@ -27,7 +27,8 @@ export const scenario: Scenario = {
     await page.locator('[aria-label="Connect alpha"]').click();
     await waitFor(async () => (await page.evaluate(() => window.__harness.sessions().length)) === 1, "1 session");
     await page.getByRole("button", { name: "Dashboard" }).click();
-    await waitFor(async () => (await page.locator('[data-testid="proc-row"]').count()) === 6, "overview rows");
+    // The overview has no process table since the htop tab (§14.4.H): wait for the tabs instead.
+    await waitFor(async () => (await page.locator('[data-testid="monitor-tab-disk"]').count()) === 1, "dashboard tabs");
 
     await page.locator('[data-testid="monitor-tab-disk"]').click();
     await waitFor(async () => (await page.locator('[data-testid="du-view"]').count()) === 1, "disk tab");

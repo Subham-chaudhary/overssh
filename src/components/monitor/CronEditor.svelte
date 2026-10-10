@@ -15,6 +15,7 @@
     type CronJob,
   } from "../../lib/cron";
   import { terminalStore } from "../../lib/terminal.svelte";
+  import { app } from "../../lib/stores.svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
@@ -112,7 +113,9 @@
 
   function runNow(j: CronJob) {
     const cmd = commandForShell(j.command);
-    void terminalStore.openNew(sessionId, { command: cmd, title: `cron: ${cmd.slice(0, 24)}` });
+    terminalStore.openNew(sessionId, { command: cmd, title: `cron: ${cmd.slice(0, 24)}` }).catch((e) => {
+      app.addToast("error", `Could not open a terminal: ${(e as { message?: string })?.message ?? String(e)}`);
+    });
   }
 
   let showSystem = $state(false);

@@ -34,6 +34,8 @@ interface FakeRepo {
   remotes: string[];
   commits: { msg: string; args: string[] }[];
   merging: boolean;
+  /** Names in the git dir (HF2: rebase/cherry-pick detection). Unset = the git dir cannot be read. */
+  gitDirEntries?: string[];
 }
 
 export const SEED_REPO = "/home/testuser/projects";
@@ -209,6 +211,8 @@ export function g1GitRun(dir: string, rawArgs: string[], stdin?: string): FakeGi
     case "remote":
       return ok(r.remotes.map((x) => `${x}\n`).join(""));
     case "rev-parse":
+      if (args.includes("--absolute-git-dir")) return r.gitDirEntries ? ok(`${r.root}/.git
+`) : null;
       if (args.includes("MERGE_HEAD")) return r.merging ? ok(`${HASH}\n`) : fail(1, "");
       if (args.includes("HEAD~1")) return r.commits.length > 0 || r.sha ? ok(`${HASH}\n`) : fail(1, "");
       return null;
@@ -324,6 +328,18 @@ export function g1GitRun(dir: string, rawArgs: string[], stdin?: string): FakeGi
       r.branches.push(args[1]);
       return ok();
     }
+    case "rebase":
+    case "cherry-pick":
+    case "revert": {
+      const ctl = args.find((a) => a === "--continue" || a === "--abort" || a === "--skip");
+      if (!ctl) return null;
+      const marker = cmd === "rebase" ? "rebase-merge" : cmd === "cherry-pick" ? "CHERRY_PICK_HEAD" : "REVERT_HEAD";
+      if (!r.gitDirEntries?.includes(marker)) return fail(128, `fatal: no ${cmd} in progress`);
+      if (ctl === "--continue" && r.files.some((f) => f.unmerged)) return fail(1, "", "error: you must edit all merge conflicts and then\nmark them as resolved using git add\n");
+      r.gitDirEntries = r.gitDirEntries.filter((n) => n !== marker);
+      if (ctl === "--abort") r.files = r.files.filter((f) => !f.unmerged);
+      return ok();
+    }
     case "merge": {
       if (args.includes("conflict-branch")) {
         r.merging = true;
@@ -372,4 +388,14 @@ export function g1Snapshot(root = SEED_REPO): Record<string, unknown> | null {
 export function g1Patch(root: string, patch: Partial<FakeRepo>): void {
   const r = repos.get(root);
   if (r) Object.assign(r, patch);
+}
+
+/** Test-only: `list_dir` of a fake repo's git dir (`<root>/.git`), or null for other paths. */
+export function g1GitDirList(path: string): { name: string; path: string; kind: "file" | "dir" }[] | null {
+  for (const r of repos.values()) {
+    if (r.gitDirEntries && path === `${r.root}/.git`) {
+      return r.gitDirEntries.map((name) => ({ name, path: `${path}/${name}`, kind: name.startsWith("rebase-") ? "dir" : "file" }));
+    }
+  }
+  return null;
 }

@@ -122,6 +122,14 @@ export function friendlyGitError(stderr: string): string {
   if (low.includes("detected dubious ownership")) {
     return `Git refuses this repository (unsafe ownership). Run "git config --global --add safe.directory <repo>" on the VM.\n${firstLines(text, 2)}`;
   }
+  if (low.includes("index.lock") && low.includes("file exists")) {
+    return `Another git process is running in this repository (index.lock exists). Wait for it, or remove .git/index.lock on the VM if no git is running.
+${firstLines(text, 2)}`;
+  }
+  if (low.includes("could not resolve host") || low.includes("connection timed out") || low.includes("connection refused")) {
+    return `The VM cannot reach the remote. Check its network, DNS or proxy settings.
+${firstLines(text, 3)}`;
+  }
   if (low.includes("please tell me who you are") || low.includes("unable to auto-detect email")) {
     return 'Git user is not set on the VM. Run: git config --global user.name "Your Name" and git config --global user.email "you@example.com".';
   }

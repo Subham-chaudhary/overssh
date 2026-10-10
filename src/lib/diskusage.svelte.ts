@@ -122,11 +122,18 @@ export class DuSession {
     this.run = run;
     try {
       const id = await api.duStart(this.sessionId, path, this.depth);
+      if (this.run !== run) {
+        // A newer scan (or Cancel) came while `du` was starting: stop this one on the VM.
+        early.delete(id);
+        void api.duCancel(id).catch(() => {});
+        return;
+      }
       run.duId = id;
       registry.set(id, { s: this, run });
       for (const e of early.get(id) ?? []) this.applyEvent(run, e);
       early.delete(id);
     } catch (e) {
+      if (this.run !== run) return;
       this.scanning = false;
       this.run = null;
       this.error = (e as { message?: string }).message ?? String(e);
@@ -135,7 +142,13 @@ export class DuSession {
 
   async cancel(): Promise<void> {
     const run = this.run;
+    // Forget it now: entries still in flight from the cancelled `du` must not land in the next scan.
+    this.run = null;
+    if (run && !run.duId) this.scanning = false; // still starting: scan() cancels it once it has an id
     if (run?.duId) {
+      registry.delete(run.duId);
+      this.scanning = false;
+      this.scanPath = null;
       try {
         await api.duCancel(run.duId);
       } catch {
@@ -171,6 +184,7 @@ export class DuSession {
 
   applyEvent(run: Running, ev: { type: "entries"; entries: DuEntry[] } | { type: "done"; done: DuDoneEvent }): void {
     if (ev.type === "entries") {
+      if (this.run !== run) return; // cancelled / superseded scan
       for (const e of ev.entries) {
         const p = norm(e.path);
         this.sizes.set(p, e.kb);
@@ -227,6 +241,8 @@ function dispatch(duId: string, ev: DuEv): void {
     const list = early.get(duId) ?? [];
     list.push(ev);
     early.set(duId, list);
+    // Events of a scan nobody registers (cancelled while starting) must not pile up.
+    if (list.length === 1) setTimeout(() => early.delete(duId), 15_000);
   }
 }
 

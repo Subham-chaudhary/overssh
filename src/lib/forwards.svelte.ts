@@ -79,7 +79,9 @@ function errorMessage(err: unknown): string {
 function scheduleSave(): void {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    void api.saveStore("forwards", $state.snapshot(forwardStore.rules));
+    api.saveStore("forwards", $state.snapshot(forwardStore.rules)).catch((err) => {
+      app.addToast("error", `Could not save port forwards: ${errorMessage(err)}`);
+    });
   }, SAVE_DEBOUNCE_MS);
 }
 
@@ -303,6 +305,12 @@ export function startRule(id: string): Promise<void> {
         return;
       }
       const info = await api.forwardStart(sessionId, specOf(live));
+      if (runtimeOf(id).status !== "starting" || !forwardStore.rules.some((r) => r.id === id)) {
+        // Stopped or removed while the listener was opening: close it again, do not report it running.
+        void api.forwardStop(info.id).catch(() => {});
+        releaseTunnel(sessionId);
+        return;
+      }
       setRuntime(id, {
         status: "running",
         forwardId: info.id,
@@ -313,6 +321,7 @@ export function startRule(id: string): Promise<void> {
       ensurePolling();
     } catch (err) {
       const msg = errorMessage(err);
+      if (runtimeOf(id).status !== "starting") return; // the user stopped it meanwhile
       setRuntime(id, { status: "error", error: msg });
       app.addToast("error", `${live.label || "Forward"}: ${msg}`);
       const sid = tunnelSessions.get(host.key);
@@ -387,7 +396,15 @@ function applyInfo(rule: ForwardRule, info: ForwardInfo): void {
 
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
-async function pollOnce(): Promise<void> {
+let polling: Promise<void> | null = null;
+
+function pollOnce(): Promise<void> {
+  // One forward_list at a time: a slow backend must not stack calls every tick.
+  polling ??= doPoll().finally(() => (polling = null));
+  return polling;
+}
+
+async function doPoll(): Promise<void> {
   try {
     const list = await api.forwardList();
     for (const info of list) {

@@ -51,6 +51,8 @@ const index = new Map<string, SearchGroup>();
 /** Events that arrive before `searchStart` resolved with the id. */
 let starting = false;
 let early: { matches?: SearchMatch[]; done?: SearchDoneEvent; id: string }[] = [];
+/** Bumped by every runSearch/cancel; a start that resolves after a newer one is cancelled. */
+let generation = 0;
 
 export function effectiveRoot(): string {
   return searchStore.root.trim() || app.activeExplorer?.cwd || "";
@@ -105,6 +107,7 @@ export async function runSearch(): Promise<void> {
   const root = effectiveRoot();
   if (!searchStore.query || !sid || !root) return;
   if (searchStore.running) await cancelSearch();
+  const my = ++generation;
   reset();
   searchStore.running = true;
   searchStore.resultSessionId = sid;
@@ -123,6 +126,11 @@ export async function runSearch(): Promise<void> {
       exclude: searchStore.exclude,
       hidden: searchStore.hidden,
     });
+    if (my !== generation) {
+      // A newer search (or Cancel) started while this one was starting: stop it on the VM.
+      void api.searchCancel(id).catch(() => {});
+      return;
+    }
     searchStore.searchId = id;
     starting = false;
     for (const ev of early) {
@@ -132,6 +140,7 @@ export async function runSearch(): Promise<void> {
     }
     early = [];
   } catch (err) {
+    if (my !== generation) return;
     starting = false;
     early = [];
     searchStore.running = false;
@@ -142,6 +151,9 @@ export async function runSearch(): Promise<void> {
 
 export async function cancelSearch(): Promise<void> {
   const id = searchStore.searchId;
+  generation++;
+  starting = false;
+  early = [];
   searchStore.running = false;
   searchStore.cancelled = true;
   searchStore.done = true;

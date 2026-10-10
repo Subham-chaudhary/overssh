@@ -6,6 +6,7 @@
 import { app } from "../../../lib/stores.svelte";
 import { GitError, gitStore } from "../../../lib/git/git.svelte";
 import { shortSha, type GitRef } from "../../../lib/git/log";
+import { friendlyGitError } from "../../../lib/git/branches";
 
 function message(err: unknown): string {
   if (err instanceof GitError) return err.message;
@@ -14,15 +15,26 @@ function message(err: unknown): string {
 
 /** Runs one git command, toasts failures. Returns true on success. */
 export async function mutate(args: string[], success?: string): Promise<boolean> {
+  // A sidebar mutation (commit, pull, ...) holds index.lock: running now would fail with a lock error.
+  if (gitStore.busy !== null) {
+    app.addToast("info", `Wait for "${gitStore.busy}" to finish first.`);
+    return false;
+  }
   try {
     await gitStore.run(args);
     if (success) app.addToast("success", success);
     return true;
   } catch (err) {
-    app.addToast("error", message(err));
+    const text = message(err);
+    if (/CONFLICT|could not apply|after resolving the conflicts/i.test(text)) {
+      app.addToast("error", `${friendlyGitError(text)}
+Resolve the conflicts in Source Control, stage the files, then Continue (or Abort).`);
+    } else app.addToast("error", friendlyGitError(text));
     return false;
   } finally {
-    gitStore.revision++;
+    // Status too (not only the graph): a conflicted cherry-pick / revert shows its Continue / Abort banner.
+    if (gitStore.repo) void gitStore.refresh(true);
+    else gitStore.revision++;
   }
 }
 

@@ -50,6 +50,20 @@ type DetectState = "detecting" | "ready" | "norepo" | "nogit";
 
 export type CommitMode = "smart" | "staged" | "all";
 
+/** A multi-step operation waiting in the repo (from the files in the git dir). */
+export type GitOperation = "merge" | "rebase" | "am" | "cherry-pick" | "revert";
+
+/** Reads the in-progress operation from the names in the git dir. Pure. */
+export function operationFromGitDir(names: Iterable<string>): GitOperation | null {
+  const set = new Set(names);
+  if (set.has("rebase-merge")) return "rebase";
+  if (set.has("rebase-apply")) return set.has("rebase-apply/applying") ? "am" : "rebase";
+  if (set.has("MERGE_HEAD")) return "merge";
+  if (set.has("CHERRY_PICK_HEAD")) return "cherry-pick";
+  if (set.has("REVERT_HEAD")) return "revert";
+  return null;
+}
+
 const EMPTY_GROUPS: GroupedStatus = { merge: [], staged: [], changes: [] };
 const EMPTY_REFS: RefList = { local: [], remote: [], tags: [] };
 const CHUNK = 150;
@@ -99,6 +113,10 @@ class GitStore {
   stashes = $state<StashEntry[]>([]);
   /** `.git/MERGE_HEAD` exists: a merge is waiting for conflicts or a commit. */
   merging = $state(false);
+  /** Rebase / am / cherry-pick / revert / merge in progress (null = none, or unknown). */
+  operation = $state<GitOperation | null>(null);
+  /** The git dir could be listed, so `operation` is reliable (else rebase actions are always offered). */
+  operationKnown = $state(false);
   /** `${sessionId}|${repo}` the data above was loaded for. */
   loadedKey = $state("");
 
@@ -123,6 +141,10 @@ class GitStore {
   private refreshAgain = false;
   private needFull = false;
   private disposers: Array<() => void> = [];
+  /** Absolute git dir per `${sid}|${repo}` (null = could not be read). */
+  private gitDirs: Record<string, string | null> = {};
+  /** Latest detect() per session; an older answer is dropped. */
+  private detectSeq: Record<string, number> = {};
 
   get sessionId(): string | null {
     return app.activeSessionId;
@@ -258,6 +280,8 @@ class GitStore {
     this.remotes = [];
     this.stashes = [];
     this.merging = false;
+    this.operation = null;
+    this.operationKnown = false;
     this.loadedKey = "";
     this.head = { branch: null, sha: null, upstream: null, ahead: 0, behind: 0 };
     this.selection = null;
@@ -279,6 +303,7 @@ class GitStore {
       else delete this.manualPaths[sid];
     }
     const start = this.startDir;
+    const seq = (this.detectSeq[sid] = (this.detectSeq[sid] ?? 0) + 1);
     if (this.detectStates[sid] !== "ready") this.detectStates[sid] = "detecting";
     let out: GitOutput;
     try {
@@ -286,7 +311,8 @@ class GitStore {
     } catch (e) {
       out = { code: -1, stdout: "", stderr: errText(e), truncated: false };
     }
-    if (!app.workspaces[sid]) return;
+    // Session gone, or a newer detection (explorer root changed again) started meanwhile.
+    if (!app.workspaces[sid] || this.detectSeq[sid] !== seq) return;
     const top = out.stdout.trim();
     if (out.code === 0 && top) {
       const changed = this.repos[sid] !== top;
@@ -360,7 +386,13 @@ class GitStore {
     const key = `${sid}|${repo}`;
     const fullNow = full || this.loadedKey !== key;
     try {
-      const [status, merge, refs, stash, remotes] = await Promise.all([
+      if (fullNow || !(key in this.gitDirs)) {
+        const gd = await api.gitRun(sid, repo, ["rev-parse", "--absolute-git-dir"]).catch(() => null);
+        const dir = gd && gd.code === 0 ? gd.stdout.trim() : "";
+        this.gitDirs[key] = dir.startsWith("/") ? dir : null;
+      }
+      const gitDir = this.gitDirs[key];
+      const [status, merge, refs, stash, remotes, gitDirList] = await Promise.all([
         api.gitRun(sid, repo, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]),
         api.gitRun(sid, repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]),
         fullNow
@@ -368,6 +400,7 @@ class GitStore {
           : null,
         fullNow ? api.gitRun(sid, repo, ["stash", "list", `--format=${STASH_FORMAT}`]) : null,
         fullNow ? api.gitRun(sid, repo, ["remote"]) : null,
+        gitDir ? api.listDir(sid, gitDir).catch(() => null) : null,
       ]);
       if (sid !== this.sessionId || repo !== this.repo) return; // switched away meanwhile
       if (status.code !== 0) {
@@ -377,10 +410,25 @@ class GitStore {
         return;
       }
       const parsed = parseStatus(status.stdout);
+      if (status.truncated) {
+        this.lastError = {
+          label: "Status",
+          message: "git status printed more than the output limit; the change list is incomplete. Add large folders to .gitignore.",
+        };
+      }
       const b = parsed.branch ?? emptyBranch();
       this.groups = groupStatus(parsed.entries);
       this.head = { branch: b.head, sha: b.oid, upstream: b.upstream, ahead: b.ahead, behind: b.behind };
-      this.merging = merge.code === 0;
+      const names = gitDirList ? gitDirList.map((e) => e.name) : [];
+      if (names.includes("rebase-apply")) {
+        // `git am` and `git rebase --apply` share rebase-apply; only am writes "applying".
+        const sub = await api.listDir(sid, `${gitDir}/rebase-apply`).catch(() => []);
+        if (sub.some((e) => e.name === "applying")) names.push("rebase-apply/applying");
+      }
+      if (sid !== this.sessionId || repo !== this.repo) return;
+      this.merging = merge.code === 0 || names.includes("MERGE_HEAD");
+      this.operation = gitDirList ? operationFromGitDir(names) : this.merging ? "merge" : null;
+      this.operationKnown = gitDirList !== null;
       if (refs && refs.code === 0) this.refs = parseRefs(refs.stdout);
       if (stash) this.stashes = stash.code === 0 ? parseStashes(stash.stdout) : [];
       if (remotes) this.remotes = remotes.code === 0 ? remotes.stdout.split("\n").filter((r) => r.trim() !== "") : [];
@@ -435,7 +483,12 @@ class GitStore {
     const message = errText(e);
     this.lastError = { label, message };
     if (/CONFLICT|Automatic merge failed|could not apply/i.test(message)) {
-      toast.warning(`${label}: conflicts`, { description: "Resolve them under Merge Changes, then commit." });
+      const stepwise = /rebase|cherry|revert|pull/i.test(label) && !/abort/i.test(label);
+      toast.warning(`${label}: conflicts`, {
+        description: stepwise
+          ? "Resolve them under Merge Changes, stage the files, then Continue (or Abort) in the banner."
+          : "Resolve them under Merge Changes, then commit.",
+      });
     } else {
       toast.error(`${label} failed`, { description: message.length > 400 ? `${message.slice(0, 400)}…` : message });
     }
@@ -855,11 +908,17 @@ class GitStore {
     await this.op("Rebase", async () => void (await this.run(["rebase", name])), { success: `Rebased onto ${name}` });
   }
 
-  rebaseControl(action: "--abort" | "--continue"): Promise<void | undefined> {
+  rebaseControl(action: "--abort" | "--continue" | "--skip"): Promise<void | undefined> {
     return this.op(
       "Rebase",
       async () => void (await this.run(["-c", "core.editor=true", "rebase", action])),
     );
+  }
+
+  /** Continue / skip / abort for cherry-pick, revert and am (no editor opens: core.editor=true). */
+  sequenceControl(op: "cherry-pick" | "revert" | "am", action: "--abort" | "--continue" | "--skip"): Promise<void | undefined> {
+    const name = op === "am" ? "Apply Patches" : op === "revert" ? "Revert" : "Cherry-pick";
+    return this.op(name, async () => void (await this.run(["-c", "core.editor=true", op, action])));
   }
 
   abortMerge(): Promise<void | undefined> {

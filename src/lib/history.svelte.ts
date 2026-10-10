@@ -42,7 +42,7 @@ let saveTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleSave(): void {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    void api.saveStore("history", { version: STORE_VERSION, entries: history, snippets });
+    api.saveStore("history", { version: STORE_VERSION, entries: history, snippets }).catch((err) => console.error("Saving command history failed", err));
   }, SAVE_DEBOUNCE_MS);
 }
 
