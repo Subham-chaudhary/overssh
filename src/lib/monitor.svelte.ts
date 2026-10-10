@@ -17,7 +17,7 @@ import type { MonitorSnapshot, ProcDetails } from "./types";
 export const SLOW_MS = 5000;
 export const HISTORY_LEN = 120;
 export const INTERVALS = [500, 1000, 2000, 5000, 10000] as const;
-export type MonTab = "overview" | "htop" | "disk" | "cron";
+export type MonTab = "overview" | "htop" | "services" | "disk" | "cron";
 
 export interface HistoryPoint {
   cpu: number;
@@ -44,6 +44,9 @@ class MonitorStore {
   private sidebarMounts = 0;
   private started = new Map<string, string>();
   private listening = false;
+  /** Failed starts / unexpected closes in a row per session (retry backoff). */
+  private failures = new Map<string, number>();
+  private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Session shown by the main view. */
   get selectedId(): string | null {
@@ -136,16 +139,24 @@ class MonitorStore {
       const key = `${ms}:${threads ? 1 : 0}`;
       if (this.started.get(id) === key) continue;
       this.started.set(id, key);
-      delete this.errors[id];
+      if (!this.failures.get(id)) delete this.errors[id];
       api.monitorStart(id, ms, threads).catch((err) => {
+        if (this.started.get(id) !== key) return; // stopped or restarted meanwhile
         this.started.delete(id);
         this.errors[id] = err?.message ?? String(err);
+        this.scheduleRetry(id);
       });
     }
     for (const id of [...this.started.keys()]) {
       if (want.has(id)) continue;
       this.started.delete(id);
       api.monitorStop(id).catch(() => {});
+    }
+    for (const id of [...this.retryTimers.keys()]) {
+      if (want.has(id)) continue;
+      clearTimeout(this.retryTimers.get(id));
+      this.retryTimers.delete(id);
+      this.failures.delete(id);
     }
     // Drop data of sessions that no longer exist.
     const live = new Set(app.sessions.map((s) => s.id));
@@ -158,10 +169,36 @@ class MonitorStore {
     }
   }
 
+  /** Restarts a stream that failed or closed on its own, 2 s doubling up to 60 s, while it is still wanted. */
+  private scheduleRetry(id: string): void {
+    if (this.retryTimers.has(id)) return;
+    const n = (this.failures.get(id) ?? 0) + 1;
+    this.failures.set(id, n);
+    const delay = Math.min(60_000, 2000 * 2 ** (n - 1));
+    this.retryTimers.set(
+      id,
+      setTimeout(() => {
+        this.retryTimers.delete(id);
+        // Gone, or reconnecting (auto-reconnect remaps the id and calls sync itself).
+        if (!app.sessions.some((s) => s.id === id)) {
+          this.failures.delete(id);
+          return;
+        }
+        this.sync();
+      }, delay),
+    );
+  }
+
   private ensureListening(): void {
     if (this.listening) return;
     this.listening = true;
     void api.onMonitorSnapshot(({ sessionId, snapshot }) => {
+      // A late snapshot of a stream we already stopped (session closed, view left) is dropped.
+      if (!this.started.has(sessionId)) return;
+      if (this.failures.has(sessionId)) {
+        this.failures.delete(sessionId);
+        delete this.errors[sessionId];
+      }
       this.snapshots[sessionId] = snapshot;
       const h = (this.history[sessionId] ??= []);
       const m = snapshot.mem;
@@ -174,8 +211,9 @@ class MonitorStore {
       if (h.length > HISTORY_LEN) h.splice(0, h.length - HISTORY_LEN);
     });
     void api.onMonitorClosed(({ sessionId, reason }) => {
-      this.started.delete(sessionId);
+      if (!this.started.delete(sessionId)) return;
       this.errors[sessionId] = reason;
+      this.scheduleRetry(sessionId);
     });
   }
 

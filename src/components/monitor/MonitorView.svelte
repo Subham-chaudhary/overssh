@@ -2,6 +2,7 @@
   // htop-style dashboard for one connected VM (§13.4.M). Data comes from
   // monitor.svelte.ts (one `sh` loop per session, parsed in Rust). Polling runs
   // only while this component is mounted.
+  import { untrack } from "svelte";
   import { app } from "../../lib/stores.svelte";
   import {
     monitor,
@@ -17,6 +18,8 @@
   import DiskUsage from "./DiskUsage.svelte";
   import CronEditor from "./CronEditor.svelte";
   import HtopView from "./HtopView.svelte";
+  import ServicesView from "./services/ServicesView.svelte";
+  import { systemd } from "../../lib/systemd/systemd.svelte";
   import { htopPrefs } from "./htopPrefs.svelte";
   import Loader from "../Loader.svelte";
   import { Button } from "$lib/components/ui/button/index.js";
@@ -36,14 +39,22 @@
     monitor.sync();
   });
 
-  type MonTab = "overview" | "htop" | "disk" | "cron";
+  type MonTab = "overview" | "htop" | "services" | "disk" | "cron";
   const TABS: { id: MonTab; label: string }[] = [
     { id: "overview", label: "Overview" },
     { id: "htop", label: "htop" },
+    { id: "services", label: "Services" },
     { id: "disk", label: "Disk usage" },
     { id: "cron", label: "Cron" },
   ];
   const tab = $derived(monitor.tab);
+
+  // Failed-units count on the Services tab (polled every 30 s while the Dashboard is open).
+  $effect(() => {
+    const sid = monitor.selectedId;
+    return untrack(() => systemd.watchBadge(sid));
+  });
+  const failedUnits = $derived(systemd.failedCount(monitor.selectedId));
 
   const snap = $derived(monitor.viewSnapshot);
   const sessionId = $derived(monitor.selectedId);
@@ -138,7 +149,7 @@
           class={`-mb-px border-b-2 px-3 py-1.5 text-[12px] font-medium ${tab === t.id ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"}`}
           data-testid={`monitor-tab-${t.id}`}
           onclick={() => (monitor.tab = t.id)}
-        >{t.label}</button>
+        >{t.label}{#if t.id === "services" && failedUnits > 0}<span class="ml-1.5 rounded-full bg-destructive px-1.5 py-px text-[10px] font-semibold leading-none text-white" title={`${failedUnits} failed unit${failedUnits === 1 ? "" : "s"}`} data-testid="svc-failed-badge">{failedUnits}</span>{/if}</button>
       {/each}
     </div>
 
@@ -153,6 +164,10 @@
     {:else if tab === "htop"}
       {#key session.id}
         <HtopView />
+      {/key}
+    {:else if tab === "services"}
+      {#key session.id}
+        <ServicesView />
       {/key}
     {:else if !snap}
       <div class="flex flex-1 items-center justify-center">

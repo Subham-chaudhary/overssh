@@ -14,8 +14,9 @@ export const scenario: Scenario = {
     // Overview has no process table; htop is its own tab next to Overview/Disk/Cron
     await waitFor(async () => (await page.locator('[data-testid="cpu-core"]').count()) === 4, "overview meters");
     assert((await page.locator('[data-testid="proc-row"]').count()) === 0, "no process table in Overview");
-    const tabs = await page.locator('[data-testid="monitor-tabs"] [role="tab"]').allInnerTexts();
-    assert(tabs.join("|") === "Overview|htop|Disk usage|Cron", `tab order, got ${tabs.join("|")}`);
+    // (the Services tab may carry a failed-units count badge, so strip trailing digits)
+    const tabs = (await page.locator('[data-testid="monitor-tabs"] [role="tab"]').allInnerTexts()).map((s) => s.replace(/\d+$/, ""));
+    assert(tabs.join("|") === "Overview|htop|Services|Disk usage|Cron", `tab order, got ${tabs.join("|")}`);
     await page.locator('[data-testid="monitor-tab-htop"]').click();
 
     // header meters
