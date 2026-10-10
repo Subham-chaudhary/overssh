@@ -37,6 +37,10 @@ import type { ITheme } from "@xterm/xterm";
 import type { Settings } from "./types";
 import { applyWindowIcon } from "./appIcon";
 import { applyAppearance, effectiveAccent, xtermThemeFor } from "./appearance";
+import { applyMotion, hintThemeFade, runThemeTransition } from "./motion";
+import { deepMerge, sanitizeSettings } from "./settingsModel";
+
+const THEME_IDS = Object.keys(THEMES);
 
 export const DEFAULTS: Settings = {
   theme: "one-dark",
@@ -45,6 +49,7 @@ export const DEFAULTS: Settings = {
     density: "normal",
     radius: "default",
     terminalAccent: true,
+    motion: "full",
   },
   editor: {
     themeOverride: null,
@@ -102,33 +107,32 @@ export const DEFAULTS: Settings = {
     ignoreWhitespace: false,
     defaultBranchName: "main",
   },
+  docker: {
+    enabled: true,
+    command: "docker",
+    logTail: 500,
+    logTimestamps: false,
+    showStoppedContainers: true,
+    confirmDestructive: true,
+    statsIntervalHint: 2,
+  },
 };
 
 type DeepPartial<T> = T extends object ? { [K in keyof T]?: DeepPartial<T[K]> } : T;
 
-/** Merges `stored` onto `defaults`, keyed off `defaults`'s own shape: missing
- * keys fall back to the default, unknown/stale keys in `stored` are dropped,
- * and a type mismatch (e.g. a corrupted primitive where an object is
- * expected) also falls back to the default rather than throwing. */
-function deepMerge<T>(defaults: T, stored: unknown): T {
-  if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
-    return defaults;
-  }
-  const result = { ...(defaults as object) } as Record<string, unknown>;
-  const storedObj = stored as Record<string, unknown>;
-  for (const key of Object.keys(defaults as object)) {
-    if (!(key in storedObj)) continue;
-    const defaultVal = (defaults as Record<string, unknown>)[key];
-    if (defaultVal !== null && typeof defaultVal === "object" && !Array.isArray(defaultVal)) {
-      result[key] = deepMerge(defaultVal, storedObj[key]);
-    } else {
-      result[key] = storedObj[key];
-    }
-  }
-  return result as T;
-}
-
 export const settings = $state<Settings>(structuredClone(DEFAULTS));
+
+/** The theme / accent that is actually in the DOM right now. It trails
+ * `settings.theme` by one view transition (docs/GUIDE.md §15.3.A), so Monaco
+ * and xterm re-theme together with the page instead of before the "old"
+ * snapshot is taken. Read through `effectiveEditorTheme()` / `terminalTheme()`. */
+export const appliedTheme = $state<{ id: ThemeId; accent: string | null; terminalAccent: boolean }>({
+  id: settings.theme,
+  accent: null,
+  terminalAccent: true,
+});
+let lastThemeSig = "";
+let lastThemeId = "";
 
 let loaded = false;
 let effectsStarted = false;
@@ -136,11 +140,25 @@ let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let iconTimer: ReturnType<typeof setTimeout> | undefined;
 
 const SAVE_DEBOUNCE_MS = 500;
+let saveFailed = false;
 
 function scheduleSave(): void {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    void api.saveStore("settings", settings);
+    api.saveStore("settings", $state.snapshot(settings)).then(
+      () => {
+        saveFailed = false;
+      },
+      (err) => {
+        // Once per failure streak, not on every change.
+        if (saveFailed) return;
+        saveFailed = true;
+        console.error("Failed to save settings", err);
+        void import("./stores.svelte").then(({ app }) =>
+          app.addToast("error", `Could not save settings: ${api.isAppError(err) ? err.message : String(err)}`),
+        );
+      },
+    );
   }, SAVE_DEBOUNCE_MS);
 }
 
@@ -177,7 +195,9 @@ export async function loadSettings(): Promise<void> {
     console.error("Failed to load settings, using defaults", err);
   }
   if (stored) {
-    Object.assign(settings, deepMerge(DEFAULTS, stored));
+    // Type-checked merge + clamp: a corrupted or hand-edited file (NaN font
+    // size, negative tab size, removed theme) falls back per field.
+    Object.assign(settings, sanitizeSettings(deepMerge(structuredClone(DEFAULTS), stored), DEFAULTS, THEME_IDS));
   }
   applyTheme();
   loaded = true;
@@ -186,7 +206,8 @@ export async function loadSettings(): Promise<void> {
 
 /** Deep-merges `patch` into the live `settings` object in one step. */
 export function updateSettings(patch: DeepPartial<Settings>): void {
-  Object.assign(settings, deepMerge(settings, patch));
+  const merged = deepMerge($state.snapshot(settings) as Settings, patch, DEFAULTS);
+  Object.assign(settings, sanitizeSettings(merged, DEFAULTS, THEME_IDS));
 }
 
 /** Sets `<html data-theme>`, toggles the `dark` class from the theme's
@@ -197,12 +218,34 @@ export function updateSettings(patch: DeepPartial<Settings>): void {
 export function applyTheme(): void {
   const theme = THEMES[settings.theme] ?? THEMES["one-dark"];
   const root = document.documentElement;
-  root.dataset.theme = theme.id;
-  root.classList.toggle("dark", theme.isDark);
-  applyAppearance(root, theme.id, settings.appearance);
+  const appearance = settings.appearance;
+  applyMotion(root, appearance.motion ?? "full");
+  const accentSetting = appearance.accent;
+  const terminalAccent = appearance.terminalAccent;
+  const commit = (): void => {
+    root.dataset.theme = theme.id;
+    root.classList.toggle("dark", theme.isDark);
+    applyAppearance(root, theme.id, appearance);
+    appliedTheme.id = theme.id;
+    appliedTheme.accent = accentSetting;
+    appliedTheme.terminalAccent = terminalAccent;
+  };
+  // Animate only real theme / accent changes (not the first apply, density,
+  // radius or motion edits).
+  const sig = `${theme.id}|${accentSetting ?? ""}`;
+  const animate = lastThemeSig !== "" && sig !== lastThemeSig;
+  const accentOnly = theme.id === lastThemeId;
+  lastThemeSig = sig;
+  lastThemeId = theme.id;
+  if (animate) {
+    if (accentOnly) hintThemeFade(50); // accent drags fire continuously: crossfade, no reveal
+    runThemeTransition(commit);
+  } else {
+    commit();
+  }
   // Debounced: dragging the accent colour input fires continuously and the
   // window icon is re-rendered on a canvas each time.
-  const accent = settings.appearance.accent ? effectiveAccent(theme.id, settings.appearance.accent) : null;
+  const accent = accentSetting ? effectiveAccent(theme.id, accentSetting) : null;
   if (iconTimer) clearTimeout(iconTimer);
   iconTimer = setTimeout(() => {
     applyWindowIcon(theme.id, accent).catch((err) => console.error("Failed to apply window icon", err));
@@ -212,12 +255,11 @@ export function applyTheme(): void {
 /** What Monaco (and anything else editor-theme-related) should use: the
  * per-tab/editor override if set, else the app theme. */
 export function effectiveEditorTheme(): ThemeId {
-  return settings.editor.themeOverride ?? settings.theme;
+  return settings.editor.themeOverride ?? appliedTheme.id;
 }
 
 /** The xterm theme for the app theme (never the editor override), with the
  * accent applied to cursor / selection unless `appearance.terminalAccent` is off. */
 export function terminalTheme(): ITheme {
-  const a = settings.appearance;
-  return xtermThemeFor(settings.theme, a.terminalAccent ? a.accent : null);
+  return xtermThemeFor(appliedTheme.id, appliedTheme.terminalAccent ? appliedTheme.accent : null);
 }

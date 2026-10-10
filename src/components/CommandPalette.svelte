@@ -14,6 +14,7 @@
   // automatically (it's a plain derived check on the input's text).
   import { onMount } from "svelte";
   import { app } from "../lib/stores.svelte";
+  import { isAppError } from "../lib/api";
   import { commandRegistry } from "../lib/commands.svelte";
   import { terminalStore } from "../lib/terminal.svelte";
   import { loadHistory, record as recordCommand, search as searchHistory } from "../lib/history.svelte";
@@ -63,7 +64,14 @@
   }
 
   function runCommand(run: () => void): void {
-    run();
+    const fail = (err: unknown) => app.addToast("error", isAppError(err) ? err.message : String(err));
+    try {
+      // Some commands are async: surface their failure instead of an unhandled rejection.
+      const result: unknown = run();
+      if (result instanceof Promise) result.catch(fail);
+    } catch (err) {
+      fail(err);
+    }
     closePalette();
   }
 
@@ -75,11 +83,16 @@
     if (!trimmed || !session) return;
     const host = `${session.user}@${session.hostname}`;
     closePalette();
-    await terminalStore.openNew(session.id, {
-      command: trimmed,
-      title: trimmed,
-      cwd: app.activeExplorer?.cwd,
-    });
+    try {
+      await terminalStore.openNew(session.id, {
+        command: trimmed,
+        title: trimmed,
+        cwd: app.activeExplorer?.cwd,
+      });
+    } catch (err) {
+      app.addToast("error", isAppError(err) ? err.message : String(err));
+      return;
+    }
     recordCommand(host, trimmed);
   }
 

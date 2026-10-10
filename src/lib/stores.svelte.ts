@@ -5,10 +5,11 @@ import { SvelteSet } from "svelte/reactivity";
 import { toast } from "svelte-sonner";
 import * as api from "./api";
 import { isAppError } from "./api";
-import { basename, dirname, join } from "./paths";
+import { basename, dirname, join, validateEntryName } from "./paths";
 import { languageName } from "./languages";
 import { touchSavedHost } from "./hosts.svelte";
 import { settings } from "./settings.svelte";
+import { registerCommand } from "./commands.svelte";
 import type {
   ConnectRequest,
   ErrorKind,
@@ -18,7 +19,7 @@ import type {
 } from "./types";
 
 /** Activity-bar views (docs/GUIDE.md §13.1). */
-export type SidebarView = "hosts" | "explorer" | "search" | "scm" | "commands" | "monitor" | "logs" | "ports";
+export type SidebarView = "hosts" | "explorer" | "search" | "scm" | "commands" | "monitor" | "logs" | "ports" | "docker";
 
 export interface Tab {
   id: string;
@@ -45,6 +46,31 @@ export interface Tab {
    * the user doesn't lose unsaved work; Editor.svelte shows a warning banner.
    * Saving clears it (a normal write recreates the file). */
   missing?: boolean;
+  /** The user confirmed saving a binary / non-UTF-8 buffer (shown lossy). */
+  lossyOk?: boolean;
+}
+
+/** Above this size (from the explorer listing) opening a file asks first. */
+const LARGE_FILE_BYTES = 5 * 1024 * 1024;
+
+/** True when the loaded text is a lossy view of the bytes on the server. */
+function isLossy(tab: Tab): boolean {
+  return tab.isBinary || tab.savedDoc.includes("\uFFFD");
+}
+
+/** Latest listing request per explorer pane / child dir: a late answer for an
+ * older request (fast navigation, refresh while loading) is dropped. */
+const listTokens = new WeakMap<object, Map<string, number>>();
+let listSeq = 0;
+function nextListToken(ex: ExplorerState, key: string): number {
+  let m = listTokens.get(ex);
+  if (!m) listTokens.set(ex, (m = new Map()));
+  const t = ++listSeq;
+  m.set(key, t);
+  return t;
+}
+function isLatestList(ex: ExplorerState, key: string, token: number): boolean {
+  return listTokens.get(ex)?.get(key) === token;
 }
 
 /** One open tab's snapshot inside a `PausedSession` (docs/GUIDE.md §12,
@@ -70,6 +96,8 @@ export interface PausedSession {
   cwd: string;
   expandedDirs: string[];
   pausedAt: number;
+  /** Second explorer pane, if the Explorer was split (§15.3.S). */
+  split?: { cwd: string; expandedDirs: string[]; active: number; ratio: number };
 }
 
 export interface SaveOptions {
@@ -114,15 +142,49 @@ export interface ExplorerState {
 export interface Workspace {
   tabs: Tab[];
   activeTabId: string | null;
-  explorer: ExplorerState;
+  /** Explorer panes: one, or two when the Explorer is split (§15.3.S). */
+  panes: ExplorerState[];
+  /** Index into `panes` of the focused pane. Shortcuts, "Set as Explorer Root",
+   * Go Up, search/disk-usage "open in explorer" and new file/folder act on it. */
+  activePane: number;
+  /** Share of the sidebar height given to pane 0 while split. */
+  splitRatio: number;
+  /** The focused pane's state (getter): all single-explorer code keeps using this. */
+  readonly explorer: ExplorerState;
 }
+
+/** A fresh explorer pane rooted at `cwd` (listing not loaded yet). */
+function newExplorerState(cwd: string, showHidden: boolean): ExplorerState {
+  return {
+    cwd,
+    entries: [],
+    loading: true,
+    error: null,
+    showHidden,
+    selected: null,
+    expanded: new SvelteSet<string>(),
+    children: {},
+    dropTarget: null,
+    multi: [],
+    dragPaths: null,
+  };
+}
+
+const MIN_SPLIT_RATIO = 0.15;
 
 /** Input dialog request driving `InputDialog.svelte`, created by `app.ask()`. */
 export interface DialogRequest {
   id: string;
   title: string;
   message?: string;
-  input?: { value: string; password?: boolean; selectStart?: number; selectEnd?: number };
+  input?: {
+    value: string;
+    password?: boolean;
+    selectStart?: number;
+    selectEnd?: number;
+    /** Returns an error message for an invalid value (shown inline, confirm disabled). */
+    validate?: (value: string) => string | null;
+  };
   confirmLabel: string;
   cancelLabel: string;
   danger?: boolean;
@@ -133,7 +195,13 @@ export interface AskOptions {
   message?: string;
   /** Present -> a text/password prompt resolving to the entered string (or
    * `null` if cancelled). Absent -> a yes/no confirm resolving to a boolean. */
-  input?: { value?: string; password?: boolean; selectRange?: [number, number] };
+  input?: {
+    value?: string;
+    password?: boolean;
+    selectRange?: [number, number];
+    /** Inline validation: an error message blocks the confirm button. */
+    validate?: (value: string) => string | null;
+  };
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
@@ -250,6 +318,8 @@ class AppState {
   private backgroundSessions: Record<string, { req: ConnectRequest; label: string }> = {};
   /** Set by the reconnect engine: returns true if it took over a dropped session. */
   reconnectHandler: ((payload: SessionClosedEvent) => boolean) | null = null;
+  /** Set by the reconnect engine: true while a dropped session is being reconnected. */
+  isSessionReconnecting: (sessionId: string) => boolean = () => false;
   private dropHooks: Array<(oldId: string) => void> = [];
   private remapHooks: Array<(oldId: string, newId: string) => void | Promise<void>> = [];
   private lostHooks: Array<(sessionId: string) => void> = [];
@@ -391,6 +461,7 @@ class AppState {
               password: opts.input.password,
               selectStart: opts.input.selectRange?.[0],
               selectEnd: opts.input.selectRange?.[1],
+              validate: opts.input.validate,
             }
           : undefined,
         confirmLabel: opts.confirmLabel ?? (opts.input ? "OK" : "Confirm"),
@@ -519,34 +590,38 @@ class AppState {
     this.workspaces[info.id] = {
       tabs: [],
       activeTabId: null,
-      explorer: {
-        cwd: info.home,
-        entries: [],
-        loading: true,
-        error: null,
-        showHidden: settings.files.showHidden,
-        selected: null,
-        expanded: new SvelteSet<string>(),
-        children: {},
-        dropTarget: null,
-        multi: [],
-        dragPaths: null,
+      panes: [newExplorerState(info.home, settings.files.showHidden)],
+      activePane: 0,
+      splitRatio: 0.5,
+      get explorer(): ExplorerState {
+        return this.panes[this.activePane] ?? this.panes[0];
       },
     };
     await this.refreshExplorer(info.id);
   }
 
-  /** Reloads the explorer's root listing (its `cwd`). Nested expanded nodes
-   * are untouched — see `refreshDir` for refreshing just one directory. */
-  async refreshExplorer(sessionId: string, path?: string): Promise<void> {
-    const ex = this.workspaces[sessionId]?.explorer;
+  /** Explorer pane `pane` of a workspace; without `pane` the focused one. */
+  paneState(sessionId: string, pane?: number): ExplorerState | undefined {
+    const ws = this.workspaces[sessionId];
+    if (!ws) return undefined;
+    return pane === undefined ? ws.explorer : ws.panes[pane];
+  }
+
+  /** Reloads an explorer pane's root listing (its `cwd`; the focused pane unless
+   * `pane` is given). Nested expanded nodes are untouched — see `refreshDir`
+   * for refreshing just one directory. */
+  async refreshExplorer(sessionId: string, path?: string, pane?: number): Promise<void> {
+    const ex = this.paneState(sessionId, pane);
     if (!ex) return;
     const target = path ?? ex.cwd;
     const navigated = target !== ex.cwd;
+    const token = nextListToken(ex, "\0root");
+    const hadListing = !ex.error;
     ex.loading = true;
     ex.error = null;
     try {
       const entries = await api.listDir(sessionId, target);
+      if (!isLatestList(ex, "\0root", token)) return; // a newer navigation / refresh won
       ex.cwd = target;
       ex.entries = entries;
       if (navigated) {
@@ -557,98 +632,185 @@ class AppState {
         ex.multi = [];
       }
     } catch (err) {
-      ex.error = errorMessage(err);
+      if (!isLatestList(ex, "\0root", token)) return;
+      if (navigated && hadListing) {
+        // Keep showing the folder we were in; say why the new one did not open
+        // (not while reconnecting: every call fails then, the banner explains it).
+        if (!this.isSessionReconnecting(sessionId)) {
+          this.addToast("error", `Cannot open ${target}: ${errorMessage(err)}`);
+        }
+      } else {
+        ex.error = errorMessage(err);
+      }
     } finally {
-      ex.loading = false;
+      if (isLatestList(ex, "\0root", token)) ex.loading = false;
     }
   }
 
-  navigateExplorer(sessionId: string, path: string): Promise<void> {
-    return this.refreshExplorer(sessionId, path);
+  /** Reloads the root listing of every pane (F5, reconnect). */
+  async refreshAllPanes(sessionId: string): Promise<void> {
+    const n = this.workspaces[sessionId]?.panes.length ?? 0;
+    await Promise.all(Array.from({ length: n }, (_, i) => this.refreshExplorer(sessionId, undefined, i)));
   }
 
-  toggleHidden(sessionId: string): void {
-    const ex = this.workspaces[sessionId]?.explorer;
+  navigateExplorer(sessionId: string, path: string, pane?: number): Promise<void> {
+    return this.refreshExplorer(sessionId, path, pane);
+  }
+
+  toggleHidden(sessionId: string, pane?: number): void {
+    const ex = this.paneState(sessionId, pane);
     if (ex) ex.showHidden = !ex.showHidden;
   }
 
-  selectPath(sessionId: string, path: string | null): void {
-    const ex = this.workspaces[sessionId]?.explorer;
+  selectPath(sessionId: string, path: string | null, pane?: number): void {
+    const ex = this.paneState(sessionId, pane);
     if (ex) {
       ex.selected = path;
       ex.multi = [];
     }
   }
 
-  /** Finds a `FileEntry` by path among the root listing or any loaded child node. */
+  /** Finds a `FileEntry` by path among the root listing or any loaded child node
+   * of any pane (the focused pane's own listing first). */
   findEntry(sessionId: string, path: string): FileEntry | null {
-    const ex = this.workspaces[sessionId]?.explorer;
-    if (!ex) return null;
-    const root = ex.entries.find((e) => e.path === path);
-    if (root) return root;
-    for (const node of Object.values(ex.children)) {
-      const found = node.entries?.find((e) => e.path === path);
-      if (found) return found;
+    const ws = this.workspaces[sessionId];
+    if (!ws) return null;
+    for (const ex of [ws.explorer, ...ws.panes.filter((p) => p !== ws.explorer)]) {
+      const root = ex.entries.find((e) => e.path === path);
+      if (root) return root;
+      for (const node of Object.values(ex.children)) {
+        const found = node.entries?.find((e) => e.path === path);
+        if (found) return found;
+      }
     }
     return null;
   }
 
-  private async loadDirNode(sessionId: string, path: string): Promise<void> {
-    const ex = this.workspaces[sessionId]?.explorer;
+  private async loadDirNode(sessionId: string, path: string, pane?: number): Promise<void> {
+    const ex = this.paneState(sessionId, pane);
     if (!ex) return;
+    const token = nextListToken(ex, path);
     ex.children[path] = { entries: ex.children[path]?.entries ?? null, loading: true, error: null };
     try {
       const entries = await api.listDir(sessionId, path);
-      ex.children[path] = { entries, loading: false, error: null };
+      if (isLatestList(ex, path, token)) ex.children[path] = { entries, loading: false, error: null };
     } catch (err) {
-      ex.children[path] = { entries: null, loading: false, error: errorMessage(err) };
+      if (isLatestList(ex, path, token)) ex.children[path] = { entries: null, loading: false, error: errorMessage(err) };
     }
   }
 
-  async expandDir(sessionId: string, path: string): Promise<void> {
-    const ex = this.workspaces[sessionId]?.explorer;
-    if (!ex) return;
+  async expandDir(sessionId: string, path: string, pane?: number): Promise<void> {
+    const ws = this.workspaces[sessionId];
+    const ex = this.paneState(sessionId, pane);
+    if (!ws || !ex) return;
     ex.expanded.add(path);
     if (!ex.children[path]) {
-      await this.loadDirNode(sessionId, path);
+      await this.loadDirNode(sessionId, path, pane ?? ws.activePane);
     }
   }
 
-  collapseDir(sessionId: string, path: string): void {
-    this.workspaces[sessionId]?.explorer.expanded.delete(path);
+  collapseDir(sessionId: string, path: string, pane?: number): void {
+    this.paneState(sessionId, pane)?.expanded.delete(path);
   }
 
-  async toggleExpandDir(sessionId: string, path: string): Promise<void> {
-    const ex = this.workspaces[sessionId]?.explorer;
+  async toggleExpandDir(sessionId: string, path: string, pane?: number): Promise<void> {
+    const ex = this.paneState(sessionId, pane);
     if (!ex) return;
     if (ex.expanded.has(path)) {
-      this.collapseDir(sessionId, path);
+      this.collapseDir(sessionId, path, pane);
     } else {
-      await this.expandDir(sessionId, path);
+      await this.expandDir(sessionId, path, pane);
     }
   }
 
   /** Refreshes just the directory affected by a mutation (create/rename/
-   * delete/upload): the root listing if it's the explorer's `cwd`, or a
+   * delete/upload) in every pane: the root listing if it's a pane's `cwd`, or a
    * loaded/expanded child node otherwise. Never collapses the rest of the tree. */
   async refreshDir(sessionId: string, dirPath: string): Promise<void> {
-    const ex = this.workspaces[sessionId]?.explorer;
-    if (!ex) return;
-    if (dirPath === ex.cwd) {
-      await this.refreshExplorer(sessionId);
+    const ws = this.workspaces[sessionId];
+    if (!ws) return;
+    await Promise.all(
+      ws.panes.map(async (ex, i) => {
+        if (dirPath === ex.cwd) {
+          await this.refreshExplorer(sessionId, undefined, i);
+        } else if (ex.expanded.has(dirPath) || ex.children[dirPath]) {
+          await this.loadDirNode(sessionId, dirPath, i);
+        }
+      }),
+    );
+  }
+
+  // --- split explorer (§15.3.S) -----------------------------------------------
+
+  /** True when the Explorer shows two panes. */
+  isExplorerSplit(sessionId: string): boolean {
+    return (this.workspaces[sessionId]?.panes.length ?? 1) > 1;
+  }
+
+  /** Makes pane `i` the focused one (no-op for an unknown index). */
+  setActivePane(sessionId: string, i: number): void {
+    const ws = this.workspaces[sessionId];
+    if (ws && i !== ws.activePane && ws.panes[i]) ws.activePane = i;
+  }
+
+  /** Splits the Explorer: a second pane rooted at `cwd` (default: the focused
+   * pane's root, with its expanded folders). The new pane becomes the focused one. */
+  async splitExplorer(sessionId: string, cwd?: string): Promise<void> {
+    const ws = this.workspaces[sessionId];
+    if (!ws || ws.panes.length > 1) return;
+    const src = ws.explorer;
+    const pane = newExplorerState(cwd ?? src.cwd, src.showHidden);
+    if (cwd === undefined || cwd === src.cwd) {
+      for (const p of src.expanded) pane.expanded.add(p);
+      pane.children = $state.snapshot(src.children) as ExplorerState["children"];
+      pane.entries = $state.snapshot(src.entries) as FileEntry[];
+      pane.loading = false;
+    }
+    ws.panes.push(pane);
+    ws.activePane = 1;
+    ws.splitRatio = 0.5;
+    if (ws.panes[1].loading) await this.refreshExplorer(sessionId, undefined, 1);
+  }
+
+  /** Closes the split, keeping pane `keep` (default: the focused one). */
+  closeExplorerSplit(sessionId: string, keep?: number): void {
+    const ws = this.workspaces[sessionId];
+    if (!ws || ws.panes.length < 2) return;
+    const kept = ws.panes[keep ?? ws.activePane] ?? ws.explorer;
+    for (const p of ws.panes) {
+      p.dragPaths = null;
+      p.dropTarget = null;
+    }
+    ws.panes = [kept];
+    ws.activePane = 0;
+  }
+
+  setSplitRatio(sessionId: string, ratio: number): void {
+    const ws = this.workspaces[sessionId];
+    if (ws) ws.splitRatio = Math.min(1 - MIN_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio));
+  }
+
+  /** "Open in Other Pane": roots the other pane at `path` and focuses it
+   * (splitting first when the Explorer is not split). */
+  async openInOtherPane(sessionId: string, path: string, fromPane?: number): Promise<void> {
+    const ws = this.workspaces[sessionId];
+    if (!ws) return;
+    if (ws.panes.length < 2) {
+      await this.splitExplorer(sessionId, path);
       return;
     }
-    if (ex.expanded.has(dirPath) || ex.children[dirPath]) {
-      await this.loadDirNode(sessionId, dirPath);
-    }
+    const from = fromPane ?? ws.activePane;
+    const other = from === 0 ? 1 : 0;
+    ws.activePane = other;
+    await this.refreshExplorer(sessionId, path, other);
   }
 
   // --- explorer file mutations (create/rename/delete/upload/copy) -----------
 
   /** Directory a keyboard/toolbar "New file/folder" targets: the selected row
    * if it's a directory, the selected file's parent, else the explorer cwd. */
-  newEntryDir(sessionId: string): string | null {
-    const ex = this.workspaces[sessionId]?.explorer;
+  newEntryDir(sessionId: string, pane?: number): string | null {
+    const ex = this.paneState(sessionId, pane);
     if (!ex) return null;
     const sel = ex.selected ? this.findEntry(sessionId, ex.selected) : null;
     if (!sel) return ex.cwd;
@@ -663,7 +825,7 @@ class AppState {
     if (!ex) return;
     if (dirPath !== ex.cwd && !ex.expanded.has(dirPath)) {
       ex.expanded.add(dirPath);
-      await this.loadDirNode(sessionId, dirPath);
+      await this.loadDirNode(sessionId, dirPath, this.workspaces[sessionId]?.activePane);
     } else {
       await this.refreshDir(sessionId, dirPath);
     }
@@ -674,8 +836,15 @@ class AppState {
   onEntryCreated: ((sessionId: string, path: string, kind: "file" | "dir") => void) | null = null;
 
   async createFileIn(sessionId: string, dirPath: string): Promise<void> {
-    const name = (await this.ask({ title: "New file", message: dirPath, input: {}, confirmLabel: "Create" }))?.trim();
-    if (!name) return;
+    const name = (
+      await this.ask({
+        title: "New file",
+        message: dirPath,
+        input: { validate: (v) => validateEntryName(v, true) },
+        confirmLabel: "Create",
+      })
+    )?.trim();
+    if (!name || validateEntryName(name, true) || !this.workspaces[sessionId]) return;
     const path = join(dirPath, name);
     try {
       await api.createFile(sessionId, path);
@@ -689,8 +858,15 @@ class AppState {
   }
 
   async createFolderIn(sessionId: string, dirPath: string): Promise<void> {
-    const name = (await this.ask({ title: "New folder", message: dirPath, input: {}, confirmLabel: "Create" }))?.trim();
-    if (!name) return;
+    const name = (
+      await this.ask({
+        title: "New folder",
+        message: dirPath,
+        input: { validate: (v) => validateEntryName(v, true) },
+        confirmLabel: "Create",
+      })
+    )?.trim();
+    if (!name || validateEntryName(name, true) || !this.workspaces[sessionId]) return;
     const path = join(dirPath, name);
     try {
       await api.createDir(sessionId, path);
@@ -718,8 +894,13 @@ class AppState {
     localPaths: string[],
     remoteDir: string,
   ): Promise<void> {
-    const { startUpload } = await import("./transfers.svelte");
-    await startUpload(sessionId, localPaths, remoteDir);
+    if (localPaths.length === 0) return;
+    try {
+      const { startUpload } = await import("./transfers.svelte");
+      await startUpload(sessionId, localPaths, remoteDir);
+    } catch (err) {
+      this.addToast("error", `Upload failed: ${errorMessage(err)}`);
+    }
   }
 
   setActiveSession(sessionId: string): void {
@@ -742,6 +923,8 @@ class AppState {
         danger: true,
       });
       if (!ok) return;
+      // Dropped (or already disconnected) while the dialog was open.
+      if (!this.sessions.some((s) => s.id === sessionId)) return;
     }
     this.closing.add(sessionId);
     try {
@@ -756,6 +939,12 @@ class AppState {
    * close: drops the session's whole workspace (tabs, active tab, explorer). */
   private dropSession(sessionId: string): void {
     this.sessions = this.sessions.filter((s) => s.id !== sessionId);
+    // Conflict dialog / diff views pointing at this workspace's tabs would be stuck.
+    const tabIds = new Set((this.workspaces[sessionId]?.tabs ?? []).map((t) => t.id));
+    if (this.conflict && tabIds.has(this.conflict.tabId)) this.conflict = null;
+    for (const id of Object.keys(this.compare)) if (tabIds.has(id)) delete this.compare[id];
+    delete this.tabMru[sessionId];
+    delete this.closedTabs[sessionId];
     const { [sessionId]: _removed, ...rest } = this.workspaces;
     this.workspaces = rest;
     delete this.connectRequests[sessionId];
@@ -883,8 +1072,8 @@ class AppState {
   private async refreshAfterReconnect(sessionId: string): Promise<void> {
     const ws = this.workspaces[sessionId];
     if (!ws) return;
-    await this.refreshExplorer(sessionId);
-    await Promise.allSettled([...ws.explorer.expanded].map((d) => this.refreshDir(sessionId, d)));
+    await this.refreshAllPanes(sessionId);
+    await Promise.allSettled(ws.panes.flatMap((p) => [...p.expanded]).map((d) => this.refreshDir(sessionId, d)));
     await Promise.allSettled(
       ws.tabs.map(async (tab) => {
         if (tab.doc !== tab.savedDoc || tab.loading || tab.missing || tab.error) return;
@@ -909,7 +1098,9 @@ class AppState {
   private schedulePausedSave(): void {
     if (this.pausedSaveTimer) clearTimeout(this.pausedSaveTimer);
     this.pausedSaveTimer = setTimeout(() => {
-      void api.saveStore("paused", this.pausedSessions);
+      api.saveStore("paused", $state.snapshot(this.pausedSessions)).catch((err) => {
+        this.addToast("error", `Could not save paused sessions: ${errorMessage(err)}`);
+      });
     }, PAUSED_SAVE_DEBOUNCE_MS);
   }
 
@@ -948,9 +1139,19 @@ class AppState {
         return { path: t.path, dirty, doc: dirty ? t.doc : null };
       }),
       activeTabPath: activeTab?.path ?? null,
-      cwd: ws.explorer.cwd,
-      expandedDirs: [...ws.explorer.expanded],
+      cwd: ws.panes[0].cwd,
+      expandedDirs: [...ws.panes[0].expanded],
       pausedAt: Date.now(),
+      ...(ws.panes.length > 1
+        ? {
+            split: {
+              cwd: ws.panes[1].cwd,
+              expandedDirs: [...ws.panes[1].expanded],
+              active: ws.activePane,
+              ratio: ws.splitRatio,
+            },
+          }
+        : {}),
     };
     this.pausedSessions.push(paused);
     this.schedulePausedSave();
@@ -986,9 +1187,17 @@ class AppState {
         const active = ws.tabs.find((t) => t.path === paused.activeTabPath);
         if (active) ws.activeTabId = active.id;
       }
-      await this.refreshExplorer(info.id, paused.cwd);
+      await this.refreshExplorer(info.id, paused.cwd, 0);
       for (const dir of paused.expandedDirs) {
-        await this.expandDir(info.id, dir);
+        await this.expandDir(info.id, dir, 0);
+      }
+      if (paused.split) {
+        await this.splitExplorer(info.id, paused.split.cwd);
+        for (const dir of paused.split.expandedDirs) {
+          await this.expandDir(info.id, dir, 1);
+        }
+        this.setSplitRatio(info.id, paused.split.ratio);
+        this.setActivePane(info.id, paused.split.active === 0 ? 0 : 1);
       }
     });
   }
@@ -1070,6 +1279,20 @@ class AppState {
       this.touchTab(sessionId, existing.id);
       return;
     }
+    const known = this.findEntry(sessionId, path);
+    if (known && known.kind === "file" && known.size > LARGE_FILE_BYTES) {
+      const ok = await this.ask({
+        title: "Large file",
+        message: `"${basename(path)}" is ${(known.size / 1024 / 1024).toFixed(1)} MB. Opening it loads the whole file into the editor, which can be slow. Open anyway?`,
+        confirmLabel: "Open",
+      });
+      if (!ok || this.workspaces[sessionId] !== ws) return;
+      const again = ws.tabs.find((t) => t.path === path); // opened meanwhile
+      if (again) {
+        ws.activeTabId = again.id;
+        return;
+      }
+    }
     const tab: Tab = {
       id: crypto.randomUUID(),
       sessionId,
@@ -1101,6 +1324,15 @@ class AppState {
     } catch (err) {
       const t = ws.tabs.find((x) => x.id === tab.id);
       if (!t) return;
+      if (isAppError(err) && err.kind === "Config") {
+        // Not a regular file (a directory, device, socket...): nothing to edit.
+        this.addToast("error", errorMessage(err));
+        const i = ws.tabs.findIndex((x) => x.id === tab.id);
+        if (i !== -1) ws.tabs.splice(i, 1);
+        this.tabMru[sessionId] = (this.tabMru[sessionId] ?? []).filter((id) => id !== tab.id);
+        if (ws.activeTabId === tab.id) ws.activeTabId = this.mruTabs(sessionId)[0]?.id ?? null;
+        return;
+      }
       t.error = errorMessage(err);
       t.tooLarge = isAppError(err) && err.kind === "TooLarge";
     } finally {
@@ -1119,6 +1351,34 @@ class AppState {
     if (!tab) return;
     const auto = opts.auto === true;
     if (auto && (tab.saving || tab.autoSavePaused || this.conflict?.tabId === tabId)) return;
+    // Never write a buffer that does not hold the file's text: still loading,
+    // failed to load (the buffer is empty) or too large to open.
+    if (tab.loading || tab.error !== null || tab.tooLarge) {
+      if (!auto && !tab.loading) this.addToast("error", `Cannot save ${basename(tab.path)}: the file is not loaded.`);
+      return;
+    }
+    // A second Ctrl+S while the first write is in flight would carry the old
+    // mtime and report a false conflict.
+    if (tab.saving) return;
+    if (this.isSessionReconnecting(tab.sessionId)) {
+      if (!auto) this.addToast("error", `Cannot save ${basename(tab.path)}: the connection is down. Save again once it is reconnected.`);
+      return;
+    }
+    if (!this.sessions.some((s) => s.id === tab.sessionId)) {
+      if (!auto) this.addToast("error", `Cannot save ${basename(tab.path)}: the session is closed.`);
+      return;
+    }
+    if (isLossy(tab) && !tab.lossyOk) {
+      if (auto) return; // never rewrite lossy bytes without asking
+      const ok = await this.ask({
+        title: "Save may change bytes",
+        message: `"${basename(tab.path)}" ${tab.isBinary ? "looks like a binary file" : "is not valid UTF-8"}. It is shown as text with replacement characters (\uFFFD), and saving writes those characters instead of the original bytes. Save anyway?`,
+        confirmLabel: "Save anyway",
+        danger: true,
+      });
+      if (!ok || tab.saving) return;
+      tab.lossyOk = true;
+    }
     tab.saving = true;
     try {
       // A `missing` tab (docs/GUIDE.md §12, "Pause session") has nothing on
@@ -1163,8 +1423,19 @@ class AppState {
         );
       } else if (isAppError(err) && err.kind === "PermissionDenied") {
         await this.trySudoSave(tab);
+      } else if (auto && this.isSessionReconnecting(tab.sessionId)) {
+        // The link dropped mid-autosave: the reconnect banner says it all; the tab stays dirty.
       } else {
-        this.addToast("error", errorMessage(err));
+        // The buffer is untouched (still dirty), so saving again is always safe.
+        const msg = errorMessage(err);
+        const hint = /incomplete/i.test(msg) ? " Your changes are still in the editor: save again." : "";
+        if (auto) {
+          // One toast, not one per autosave tick: pause until a manual save works.
+          tab.autoSavePaused = true;
+          this.addToast("error", `Autosave paused for ${basename(tab.path)}: ${msg}${hint} Press Ctrl+S to retry.`);
+        } else {
+          this.addToast("error", `Could not save ${basename(tab.path)}: ${msg}${hint}`);
+        }
       }
     } finally {
       tab.saving = false;
@@ -1192,6 +1463,9 @@ class AppState {
       );
       tab.mtime = newMtime;
       tab.savedDoc = tab.doc;
+      tab.autoSavePaused = false;
+      tab.missing = false;
+      if (this.conflict?.tabId === tab.id) this.conflict = null;
       this.addToast("success", `Saved ${basename(tab.path)} with sudo`);
     } catch (err) {
       this.addToast("error", errorMessage(err));
@@ -1204,7 +1478,63 @@ class AppState {
   resolveConflictOverwrite(): void {
     const c = this.conflict;
     if (!c) return;
+    if (!this.findTab(c.tabId)) {
+      this.conflict = null; // the tab closed meanwhile
+      return;
+    }
     void this.saveTab(c.tabId, true);
+  }
+
+  /** Re-reads a tab from the server (the editor's "Retry" after a failed load).
+   * Asks first when the tab has unsaved changes. */
+  async reloadTab(tabId: string): Promise<void> {
+    const tab = this.findTab(tabId);
+    if (!tab || tab.loading) return;
+    if (tab.doc !== tab.savedDoc) {
+      const ok = await this.ask({
+        title: "Reload from server",
+        message: `Discard the unsaved changes in "${basename(tab.path)}"?`,
+        confirmLabel: "Discard and reload",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    tab.loading = true;
+    tab.error = null;
+    tab.tooLarge = false;
+    try {
+      const content = await api.readFile(tab.sessionId, tab.path);
+      tab.doc = content.content;
+      tab.savedDoc = content.content;
+      tab.mtime = content.mtime;
+      tab.isBinary = content.isBinary;
+      tab.missing = false;
+      tab.lossyOk = false;
+    } catch (err) {
+      tab.error = errorMessage(err);
+      tab.tooLarge = isAppError(err) && err.kind === "TooLarge";
+    } finally {
+      tab.loading = false;
+    }
+  }
+
+  /** Number of tabs with unsaved changes across every workspace. */
+  dirtyTabCount(): number {
+    let n = 0;
+    for (const ws of Object.values(this.workspaces)) n += ws.tabs.filter((t) => t.doc !== t.savedDoc).length;
+    return n;
+  }
+
+  /** Before quitting: true when nothing is unsaved or the user chose to discard it. */
+  async confirmQuit(): Promise<boolean> {
+    const n = this.dirtyTabCount();
+    if (n === 0) return true;
+    return this.ask({
+      title: "Unsaved changes",
+      message: `${n} file${n === 1 ? " has" : "s have"} unsaved changes. Quit anyway and lose them?`,
+      confirmLabel: "Quit anyway",
+      danger: true,
+    });
   }
 
   /** Conflict dialog: discard local edits and reload the server copy. */
@@ -1312,6 +1642,8 @@ class AppState {
     const idx = ws.tabs.findIndex((t) => t.id === tabId);
     if (idx === -1) return;
     ws.tabs.splice(idx, 1);
+    delete this.compare[tabId];
+    if (this.conflict?.tabId === tabId) this.conflict = null;
     this.tabMru[tab.sessionId] = (this.tabMru[tab.sessionId] ?? []).filter((id) => id !== tabId);
     if (!this.closedTabs[tab.sessionId]) this.closedTabs[tab.sessionId] = [];
     this.closedTabs[tab.sessionId].push({ path: tab.path, line: tab.line, col: tab.col });
@@ -1332,3 +1664,26 @@ export const app = new AppState();
 // evaluated. Mirrors settings.svelte.ts's `loadSettings()` / hosts.svelte.ts's
 // `initHosts()`, just self-triggered instead of caller-triggered.
 void app.loadPausedSessions();
+
+// Split Explorer palette commands (§15.3.S). Registered here (not in a component)
+// so they exist whether or not the Explorer sidebar is mounted.
+registerCommand({
+  id: "explorer.split",
+  title: "Explorer: Split",
+  category: "View",
+  run: () => {
+    const id = app.activeSessionId;
+    if (!id) return;
+    app.sidebarView = "explorer";
+    void app.splitExplorer(id);
+  },
+});
+registerCommand({
+  id: "explorer.closeSplit",
+  title: "Explorer: Close Split",
+  category: "View",
+  run: () => {
+    const id = app.activeSessionId;
+    if (id) app.closeExplorerSplit(id);
+  },
+});

@@ -105,7 +105,17 @@
 
   function resolvePort(): number {
     const portNum = Number(port);
-    return Number.isInteger(portNum) && portNum > 0 ? portNum : 22;
+    return Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? portNum : 22;
+  }
+
+  /** An explicit port that is not 1..65535 (empty means the default 22). */
+  function portInvalid(): boolean {
+    const raw = port.trim();
+    if (raw === "") return false;
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 1 && n <= 65535) return false;
+    app.addToast("error", "Port must be a whole number from 1 to 65535.");
+    return true;
   }
 
   /** "Save as new host" (docs/GUIDE.md §12): creates a new app-only saved
@@ -115,7 +125,7 @@
    * what it was prefilled with. `saveHost` itself refuses to duplicate an
    * identical existing saved host. */
   function saveAsNewHost(): void {
-    if (!canSaveAsNew) return;
+    if (!canSaveAsNew || portInvalid()) return;
     const trimmedHost = hostname.trim();
     if (!trimmedHost) return;
     const resolvedUser = user.trim();
@@ -133,13 +143,17 @@
   }
 
   async function browseKey(): Promise<void> {
-    const path = await openDialog({ multiple: false, title: "Select private key" });
-    if (typeof path === "string") identityFile = path;
+    try {
+      const path = await openDialog({ multiple: false, title: "Select private key" });
+      if (typeof path === "string") identityFile = path;
+    } catch (err) {
+      app.addToast("error", `Cannot open the file picker: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async function submit(e: SubmitEvent): Promise<void> {
     e.preventDefault();
-    if (!hostname.trim()) return;
+    if (!hostname.trim() || portInvalid()) return;
     const resolvedPort = resolvePort();
 
     if (mode === "edit" && hostId) {

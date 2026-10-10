@@ -255,6 +255,7 @@ export function isReconnecting(sessionId: string): boolean {
 // --- wiring -----------------------------------------------------------------
 
 app.reconnectHandler = begin;
+app.isSessionReconnecting = isReconnecting;
 app.onSessionLost(cancelItem);
 
 // --- sleep / network-change detection ------------------------------------------

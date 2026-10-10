@@ -32,8 +32,21 @@
     }
   });
 
+  /** Inline validation (e.g. file names): shown under the field, blocks confirm. */
+  const invalid = $derived(req?.input?.validate ? req.input.validate(value) : null);
+  /** Show the message only once the user typed something (not for the empty start). */
+  let touched = $state(false);
+  $effect(() => {
+    void req?.id;
+    touched = false;
+  });
+
   function confirm(): void {
     if (!req) return;
+    if (req.input && invalid) {
+      touched = true;
+      return;
+    }
     app.resolveDialog(req.input ? value : true);
   }
 
@@ -65,10 +78,15 @@
           bind:value
           bind:ref={inputRef}
           spellcheck="false"
+          aria-invalid={touched && invalid ? "true" : undefined}
+          oninput={() => (touched = true)}
         />
+        {#if touched && invalid}
+          <p class="mt-1.5 text-[12px] text-destructive" data-testid="input-dialog-error">{invalid}</p>
+        {/if}
         <Dialog.Footer>
           <Button type="button" variant="outline" onclick={cancel}>{req.cancelLabel}</Button>
-          <Button type="submit" variant={req.danger ? "destructive" : "default"}
+          <Button type="submit" variant={req.danger ? "destructive" : "default"} disabled={!!invalid}
             >{req.confirmLabel}</Button
           >
         </Dialog.Footer>
