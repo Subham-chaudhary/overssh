@@ -450,3 +450,16 @@
   --tab-active-bg: #1f1f28;
   --tab-inactive-bg: #16161d;
 }
+
+/* Window chrome buttons (components/chrome/WindowControls.svelte, GUIDE §15.3.T).
+   close = the theme's red, minimize = its blue, maximize = its yellow. */
+[data-theme="one-dark"]        { --chrome-close: #e06c75; --chrome-min: #61afef; --chrome-max: #e5c07b; }
+[data-theme="dracula"]         { --chrome-close: #ff5555; --chrome-min: #6e9bf5; --chrome-max: #f1fa8c; }
+[data-theme="tokyo-night"]     { --chrome-close: #f7768e; --chrome-min: #7aa2f7; --chrome-max: #e0af68; }
+[data-theme="catppuccin-mocha"]{ --chrome-close: #f38ba8; --chrome-min: #89b4fa; --chrome-max: #f9e2af; }
+[data-theme="github-light"]    { --chrome-close: #cf222e; --chrome-min: #0969da; --chrome-max: #d4a72c; }
+[data-theme="github-dark"]     { --chrome-close: #ff7b72; --chrome-min: #58a6ff; --chrome-max: #d29922; }
+[data-theme="nord"]            { --chrome-close: #bf616a; --chrome-min: #81a1c1; --chrome-max: #ebcb8b; }
+[data-theme="rose-pine"]       { --chrome-close: #eb6f92; --chrome-min: #569fba; --chrome-max: #f6c177; }
+[data-theme="gruvbox-dark"]    { --chrome-close: #fb4934; --chrome-min: #83a598; --chrome-max: #fabd2f; }
+[data-theme="kanagawa"]        { --chrome-close: #e46876; --chrome-min: #7e9cd8; --chrome-max: #e6c384; }
