@@ -9,8 +9,8 @@
 
 :root {
   --radius: 0.625rem;
-  --font-ui: "Segoe UI", system-ui, sans-serif;
-  --font-mono: "Cascadia Code", Consolas, monospace;
+  --font-ui: "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, Ubuntu, Cantarell, "Noto Sans", sans-serif;
+  --font-mono: "Cascadia Code", Consolas, Menlo, "SF Mono", "DejaVu Sans Mono", "Liberation Mono", monospace;
 }
 
 /* Fallback tokens (= the "one-dark" theme) so the page isn't unstyled before

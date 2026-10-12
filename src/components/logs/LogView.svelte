@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { clipboardWrite } from "$lib/clipboard";
   import { untrack } from "svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
@@ -307,7 +308,7 @@
         size="icon-sm"
         aria-label="Copy lines"
         title="Copy selected lines (or all visible)"
-        onclick={() => void navigator.clipboard?.writeText(linesForAction(tab).join("\n"))}
+        onclick={() => void clipboardWrite(linesForAction(tab).join("\n"))}
       >
         <CopyIcon class="size-4" />
       </Button>

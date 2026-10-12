@@ -5,6 +5,7 @@
 // Nothing here reads or writes ~/.ssh/config; secrets never enter a bundle
 // (format.ts whitelists every field) and the backup is taken from the live
 // stores, not from the bundle.
+import { clipboardWrite } from "$lib/clipboard";
 import * as api from "../api";
 import { settings, DEFAULTS, updateSettings } from "../settings.svelte";
 import { THEMES } from "../themes";
@@ -202,7 +203,7 @@ export async function exportToFile(selected: readonly SectionId[]): Promise<stri
 /** "Copy as text": the caller writes `text` to the clipboard. */
 export async function exportToClipboard(selected: readonly SectionId[]): Promise<string> {
   const { text, bundle } = await exportText(selected);
-  await navigator.clipboard.writeText(text);
+  await clipboardWrite(text);
   recordExport(bundle, null);
   return text;
 }

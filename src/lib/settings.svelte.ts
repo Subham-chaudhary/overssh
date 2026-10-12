@@ -53,7 +53,7 @@ export const DEFAULTS: Settings = {
   },
   editor: {
     themeOverride: null,
-    fontFamily: "Cascadia Code, Consolas, monospace",
+    fontFamily: "Cascadia Code, Consolas, Menlo, SF Mono, DejaVu Sans Mono, Liberation Mono, monospace",
     fontSize: 13,
     ligatures: false,
     minimap: true,

@@ -1,6 +1,6 @@
 [package]
 name = "overssh"
-version = "0.1.0"
+version = "1.2.13"
 description = "Edit and browse remote VMs over plain SSH/SFTP"
 edition = "2021"
 
@@ -21,6 +21,7 @@ russh-sftp = "3.0.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net"] }
 thiserror = "2.0.21"
 uuid = { version = "1.26.1", features = ["v4"] }
+tauri-plugin-clipboard-manager = "2"
 
 [profile.release]
 codegen-units = 1

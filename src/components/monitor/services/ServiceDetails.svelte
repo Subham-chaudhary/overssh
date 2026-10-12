@@ -1,5 +1,6 @@
 <script lang="ts">
   // Details drawer for one unit (§15.3.V): properties, unit file, journal, dependencies, timers.
+  import { clipboardWrite } from "$lib/clipboard";
   import { untrack } from "svelte";
   import * as api from "../../../lib/api";
   import { app } from "../../../lib/stores.svelte";
@@ -158,7 +159,7 @@
 
   async function copy(text: string) {
     try {
-      await navigator.clipboard.writeText(text);
+      await clipboardWrite(text);
     } catch {
       /* ignore */
     }

@@ -2,6 +2,7 @@
   // Docker main page (docs/GUIDE.md §15.3.D): lazydocker-like. Left: list of the current
   // scope (containers, images, volumes, networks, compose projects). Right: tabbed detail
   // of the selected object. Narrow pages (< 640 px) show one pane at a time.
+  import { clipboardWrite } from "$lib/clipboard";
   import { onMount } from "svelte";
   import { dockerStore, type SelKind } from "$lib/docker/docker.svelte";
   import { isRunning, formatBytes, type Container } from "$lib/docker/parse";
@@ -227,7 +228,7 @@
         run ? { label: "Stop", shortcut: "s", onclick: () => void dockerStore.containerAction(c, "stop") } : { label: "Start", shortcut: "s", onclick: () => void dockerStore.containerAction(c, "start") },
         { label: "Restart", shortcut: "r", onclick: () => void dockerStore.containerAction(c, "restart") },
         { label: "Exec shell", shortcut: "e", disabled: !run, onclick: () => dockerStore.execShell(c) },
-        { label: "Copy ID", onclick: () => void navigator.clipboard?.writeText(c.id) },
+        { label: "Copy ID", onclick: () => void clipboardWrite(c.id) },
         { sep: true, label: "" },
         { label: "Remove…", shortcut: "d", danger: true, onclick: () => void removeAsk(c) },
       ],

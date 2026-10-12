@@ -1,5 +1,6 @@
 <script lang="ts">
   // `docker inspect` as a collapsible JSON tree with search. Env values are masked by default.
+  import { clipboardWrite } from "$lib/clipboard";
   import { dockerStore } from "$lib/docker/docker.svelte";
   import { friendlyDockerError } from "$lib/docker/parse";
   import { app } from "$lib/stores.svelte";
@@ -54,7 +55,7 @@
     try {
       let text = JSON.stringify(data, null, 2);
       if (!reveal) text = text.replace(/("[A-Za-z0-9_.\-]+=)[^"]*(")/g, "$1••••••$2");
-      await navigator.clipboard.writeText(text);
+      await clipboardWrite(text);
       app.addToast("info", reveal ? "Inspect JSON copied" : "Inspect JSON copied (env values masked)");
     } catch {
       app.addToast("error", "Clipboard access denied");

@@ -1,6 +1,7 @@
 <script lang="ts">
   // Import settings (docs/GUIDE.md §15.3.Y): choose a file or paste text, preview
   // what would change, resolve conflicts, apply (a backup is taken first), undo.
+  import { clipboardRead } from "$lib/clipboard";
   import { toast } from "svelte-sonner";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
@@ -96,7 +97,7 @@
   async function pasteClipboard(): Promise<void> {
     error = "";
     try {
-      text = await navigator.clipboard.readText();
+      text = await clipboardRead();
     } catch {
       error = "Could not read the clipboard. Paste the text into the box instead.";
     }

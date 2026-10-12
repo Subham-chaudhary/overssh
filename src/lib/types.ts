@@ -106,7 +106,7 @@ export interface Settings {
   };
   editor: {
     themeOverride: ThemeId | null;
-    fontFamily: string; // default "Cascadia Code, Consolas, monospace"
+    fontFamily: string; // default "Cascadia Code, Consolas, Menlo, ..., monospace"
     fontSize: number; // 13
     ligatures: boolean; // false
     minimap: boolean; // true

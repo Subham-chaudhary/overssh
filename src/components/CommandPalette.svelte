@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatShortcut } from "$lib/platform";
   // Command palette (Ctrl+Shift+P), built on shadcn's Command component and a
   // small extensible registry (src/lib/commands.svelte.ts) — other modules
   // (P3's editor, P5's terminal) can `registerCommand()` more entries later.
@@ -163,7 +164,7 @@
             <Command.Item value={cmd.title} onSelect={() => runCommand(cmd.run)}>
               {cmd.title}
               {#if cmd.keybinding}
-                <Command.Shortcut><Kbd>{cmd.keybinding}</Kbd></Command.Shortcut>
+                <Command.Shortcut><Kbd>{formatShortcut(cmd.keybinding)}</Kbd></Command.Shortcut>
               {/if}
             </Command.Item>
           {/each}

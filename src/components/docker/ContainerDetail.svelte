@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { clipboardWrite } from "$lib/clipboard";
   import { dockerStore } from "$lib/docker/docker.svelte";
   import { isRunning, type Container, type ContainerInspect } from "$lib/docker/parse";
   import { dotClass } from "$lib/docker/ui";
@@ -111,7 +112,7 @@
         <Button size="sm" variant="outline" class={btn} title="Attach (a)" data-testid="docker-act-attach" onclick={() => dockerStore.attach(c)}><PlugIcon class="size-3.5" /><span class="hidden @lg/main:inline">Attach</span></Button>
       {/if}
       <Button size="sm" variant="outline" class={btn} title="Rename" data-testid="docker-act-rename" onclick={rename}><PencilIcon class="size-3.5" /><span class="hidden @lg/main:inline">Rename</span></Button>
-      <Button size="sm" variant="outline" class={btn} title="Copy container ID" data-testid="docker-act-copyid" onclick={() => { void navigator.clipboard?.writeText(c.id); app.addToast("info", "Container ID copied"); }}><CopyIcon class="size-3.5" /><span class="hidden @lg/main:inline">Copy ID</span></Button>
+      <Button size="sm" variant="outline" class={btn} title="Copy container ID" data-testid="docker-act-copyid" onclick={() => { void clipboardWrite(c.id); app.addToast("info", "Container ID copied"); }}><CopyIcon class="size-3.5" /><span class="hidden @lg/main:inline">Copy ID</span></Button>
       <Button size="sm" variant="outline" class={btn} title="View inspect JSON" data-testid="docker-act-inspect" onclick={() => (dockerStore.tab.container = "inspect")}><FileJsonIcon class="size-3.5" /><span class="hidden @lg/main:inline">Inspect</span></Button>
       <Button size="sm" variant="outline" class={`${btn} text-destructive`} title="Remove (d)" data-testid="docker-act-remove" disabled={!!busy} onclick={openRemove}><Trash2Icon class="size-3.5" /><span class="hidden @lg/main:inline">Remove</span></Button>
     </div>

@@ -4,6 +4,7 @@
   // (Ctrl+W/T/Shift+T, Ctrl+Tab switcher over the terminals) and Toaster.
   import { onMount, untrack } from "svelte";
   import { app } from "../lib/stores.svelte";
+  import { modKey } from "../lib/platform";
   import { settings } from "../lib/settings.svelte";
   import { THEMES } from "../lib/themes";
   import { isAppError } from "../lib/api";
@@ -80,7 +81,7 @@
   }
 
   function onKeydownCapture(e: KeyboardEvent): void {
-    const mod = e.ctrlKey || e.metaKey;
+    const mod = modKey(e);
     const key = e.key.toLowerCase();
 
     if (tabSwitcher.active) {

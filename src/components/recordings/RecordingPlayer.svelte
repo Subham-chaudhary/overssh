@@ -96,7 +96,7 @@
       disableStdin: true,
       cursorBlink: false,
       scrollback: 5000,
-      fontFamily: "'Cascadia Code', Consolas, monospace",
+      fontFamily: "'Cascadia Code', Consolas, Menlo, 'SF Mono', 'DejaVu Sans Mono', 'Liberation Mono', monospace",
       fontSize: settings.terminal.fontSize,
       theme: terminalTheme(),
       allowProposedApi: true,

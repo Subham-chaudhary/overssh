@@ -1,5 +1,6 @@
 // Snippet runner + shared dialog state (docs/GUIDE.md §13.4.N).
 // `snippetUi` is read by the dialogs rendered inside CommandHistory.svelte.
+import { clipboardRead, clipboardWrite } from "$lib/clipboard";
 import * as api from "../../lib/api";
 import { isAppError } from "../../lib/api";
 import { app } from "../../lib/stores.svelte";
@@ -45,7 +46,7 @@ export async function resolveBuiltins(needed: readonly BuiltinName[]): Promise<P
   if (needed.includes("date")) out.date = formatDate(new Date());
   if (needed.includes("clipboard")) {
     try {
-      out.clipboard = await navigator.clipboard.readText();
+      out.clipboard = await clipboardRead();
     } catch {
       out.clipboard = "";
     }
@@ -90,7 +91,7 @@ async function ensureTargetTerminal(): Promise<string | null> {
 
 export async function copyText(text: string): Promise<void> {
   try {
-    await navigator.clipboard.writeText(text);
+    await clipboardWrite(text);
     app.addToast("info", "Copied to clipboard");
   } catch {
     app.addToast("error", "Clipboard access denied");

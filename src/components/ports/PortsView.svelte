@@ -1,6 +1,7 @@
 <script lang="ts">
   // Ports sidebar: SSH port-forward manager (docs/GUIDE.md §13.4.P). Rules are
   // grouped by host; each can be started/stopped, edited, deleted.
+  import { clipboardWrite } from "$lib/clipboard";
   import { onMount } from "svelte";
   import { app } from "../../lib/stores.svelte";
   import { settings } from "../../lib/settings.svelte";
@@ -103,7 +104,7 @@
   async function copyUrl(r: ForwardRule): Promise<void> {
     const url = r.kind === "D" ? `socks5://localhost:${runtimeOf(r.id).boundPort ?? r.bindPort}` : localUrl(r);
     try {
-      await navigator.clipboard.writeText(url);
+      await clipboardWrite(url);
       app.addToast("success", `Copied ${url}`);
     } catch {
       app.addToast("info", url);

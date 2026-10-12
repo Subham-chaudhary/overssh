@@ -24,8 +24,16 @@ use terminal::TerminalManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's DMA-BUF renderer shows a blank window on many NVIDIA and
+    // VM setups. Opt out unless the user chose a value themselves.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(SessionManager::new())
         .manage(TerminalManager::new())
         .manage(std::sync::Arc::new(monitor::MonitorManager::new()))
@@ -137,6 +145,18 @@ pub fn run() {
             localfs::local_write_text,
             localfs::local_read_text,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            // macOS: clicking the Dock icon brings back a main window that was
+            // hidden to the tray.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows: false, .. } = _event {
+                use tauri::Manager;
+                if let Some(w) = _app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        });
 }

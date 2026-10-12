@@ -1,6 +1,7 @@
 // Single shared app state (Svelte 5 runes), per docs/GUIDE.md §7.
 // Components read/mutate `app` directly; all backend I/O goes through lib/api.ts.
 
+import { clipboardWrite } from "$lib/clipboard";
 import { SvelteSet } from "svelte/reactivity";
 import { toast } from "svelte-sonner";
 import * as api from "./api";
@@ -880,7 +881,7 @@ class AppState {
 
   async copyPath(path: string): Promise<void> {
     try {
-      await navigator.clipboard.writeText(path);
+      await clipboardWrite(path);
       this.addToast("info", "Path copied");
     } catch {
       this.addToast("error", "Clipboard access denied");

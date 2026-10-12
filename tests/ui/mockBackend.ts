@@ -783,6 +783,9 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
       // Window chrome (§15.3.T): minimize / maximize / close / title are only recorded.
       if (cmd.startsWith("plugin:window|")) return windowCommand(cmd.slice("plugin:window|".length), args);
       if (cmd === "plugin:app|version") return "0.1.0";
+      // Clipboard plugin: route to the page clipboard so scenarios can read it back.
+      if (cmd === "plugin:clipboard-manager|read_text") return navigator.clipboard.readText();
+      if (cmd === "plugin:clipboard-manager|write_text") return navigator.clipboard.writeText(String(args.text ?? ""));
       console.warn(`[harness] unhandled command: ${cmd}`, args);
       return null;
   }

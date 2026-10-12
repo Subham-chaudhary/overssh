@@ -1,5 +1,6 @@
 <script lang="ts">
   // One changed file in a Source Control section.
+  import { clipboardWrite } from "$lib/clipboard";
   import { gitStore } from "$lib/git/git.svelte";
   import { badgeTitle, type Change } from "$lib/git/status";
   import { basename, dirname } from "$lib/paths";
@@ -106,6 +107,6 @@
       {/if}
     {/if}
     <ContextMenu.Separator />
-    <ContextMenu.Item onclick={() => void navigator.clipboard?.writeText(change.path)}>Copy Relative Path</ContextMenu.Item>
+    <ContextMenu.Item onclick={() => void clipboardWrite(change.path)}>Copy Relative Path</ContextMenu.Item>
   </ContextMenu.Content>
 </ContextMenu.Root>

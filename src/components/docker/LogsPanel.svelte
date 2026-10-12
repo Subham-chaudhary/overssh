@@ -2,6 +2,7 @@
   // Live container (or compose project) logs: follow, timestamps, tail N, search filter, wrap,
   // clear, ANSI colours, scroll-up pauses auto-scroll, copy and download. The UI keeps a
   // ring buffer of 10 000 lines; the list is windowed unless wrapping is on.
+  import { clipboardWrite } from "$lib/clipboard";
   import { onDestroy, tick, untrack } from "svelte";
   import { save } from "@tauri-apps/plugin-dialog";
   import * as api from "$lib/api";
@@ -163,7 +164,7 @@
 
   async function copy(): Promise<void> {
     try {
-      await navigator.clipboard.writeText(plainLines().join("\n"));
+      await clipboardWrite(plainLines().join("\n"));
       app.addToast("info", `Copied ${lines.length} lines`);
     } catch {
       app.addToast("error", "Clipboard access denied");

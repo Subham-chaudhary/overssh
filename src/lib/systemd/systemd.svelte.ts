@@ -5,6 +5,7 @@
 // (list + stats, 5 s) or MonitorView is mounted (failed count, 30 s). All remote
 // work goes through api.systemd* (exec channels); nothing is installed on the VM.
 
+import { clipboardWrite } from "$lib/clipboard";
 import { toast } from "svelte-sonner";
 import * as api from "../api";
 import { app } from "../stores.svelte";
@@ -337,7 +338,7 @@ class SystemdStore {
 
   async copyCommand(p: SudoPrompt): Promise<void> {
     try {
-      await navigator.clipboard.writeText(p.command);
+      await clipboardWrite(p.command);
       toast.success("Command copied");
     } catch {
       toast.error("Could not copy to the clipboard");

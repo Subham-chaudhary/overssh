@@ -3,6 +3,7 @@
 // cherry-pick / merge can leave the repo mid-operation) so the graph and the
 // Source Control sidebar reload.
 
+import { clipboardWrite } from "$lib/clipboard";
 import { app } from "../../../lib/stores.svelte";
 import { GitError, gitStore } from "../../../lib/git/git.svelte";
 import { shortSha, type GitRef } from "../../../lib/git/log";
@@ -125,7 +126,7 @@ export async function mergeRef(ref: GitRef): Promise<boolean> {
 
 export async function copyText(text: string, what: string): Promise<void> {
   try {
-    await navigator.clipboard.writeText(text);
+    await clipboardWrite(text);
     app.addToast("info", `Copied ${what}`);
   } catch {
     app.addToast("error", "Could not copy to the clipboard");

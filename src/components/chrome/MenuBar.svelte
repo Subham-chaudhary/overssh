@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatShortcut } from "$lib/platform";
   // Application menu bar (docs/GUIDE.md §15.3.T): File / Edit / View / Go /
   // Terminal / Help. Click opens a menu, then hovering another title switches,
   // Left/Right moves between menus, Up/Down between items, Esc closes. Alt (tap)
@@ -129,7 +130,7 @@
           {:else}
             <Menubar.Item data-testid={entry.testid} onSelect={() => choose(entry.run)}>
               <span class="truncate">{entry.label}</span>
-              {#if entry.hint}<Menubar.Shortcut>{entry.hint}</Menubar.Shortcut>{/if}
+              {#if entry.hint}<Menubar.Shortcut>{formatShortcut(entry.hint)}</Menubar.Shortcut>{/if}
             </Menubar.Item>
           {/if}
         {/each}

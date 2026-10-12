@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatShortcut } from "$lib/platform";
   // Fixed-position menu at the cursor (docs/GUIDE.md §3 item 3). Kept as a
   // plain Tailwind-styled popup rather than shadcn's trigger-anchored
   // `context-menu` primitive: the menu is opened programmatically at an
@@ -294,13 +295,13 @@
     type="button"
     role="menuitem"
     class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
-    onclick={newFile}><FilePlusIcon class="size-3.5" /> New file<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+N</span></button
+    onclick={newFile}><FilePlusIcon class="size-3.5" /> New file<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+N")}</span></button
   >
   <button
     type="button"
     role="menuitem"
     class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
-    onclick={newFolder}><FolderPlusIcon class="size-3.5" /> New folder<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+Shift+N</span></button
+    onclick={newFolder}><FolderPlusIcon class="size-3.5" /> New folder<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+Shift+N")}</span></button
   >
   <div class="my-0.5 h-px bg-border"></div>
   {#if entry}
@@ -308,13 +309,13 @@
       type="button"
       role="menuitem"
       class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
-      onclick={() => doCopyFiles("cut")}><ScissorsIcon class="size-3.5" /> Cut<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+X</span></button
+      onclick={() => doCopyFiles("cut")}><ScissorsIcon class="size-3.5" /> Cut<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+X")}</span></button
     >
     <button
       type="button"
       role="menuitem"
       class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
-      onclick={() => doCopyFiles("copy")}><CopyIcon class="size-3.5" /> Copy<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+C</span></button
+      onclick={() => doCopyFiles("copy")}><CopyIcon class="size-3.5" /> Copy<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+C")}</span></button
     >
   {/if}
   <button
@@ -322,7 +323,7 @@
     role="menuitem"
     disabled={!canPaste(sessionId)}
     class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent disabled:pointer-events-none disabled:opacity-40"
-    onclick={doPaste}><ClipboardPasteIcon class="size-3.5" /> Paste<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+V</span></button
+    onclick={doPaste}><ClipboardPasteIcon class="size-3.5" /> Paste<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+V")}</span></button
   >
   {#if entry}
     <button
@@ -352,7 +353,7 @@
         type="button"
         role="menuitem"
         class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
-        onclick={doUndo}>Undo {undoLabel(sessionId)}<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+Z</span></button
+        onclick={doUndo}>Undo {undoLabel(sessionId)}<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+Z")}</span></button
       >
     {/if}
     {#if redoLabel(sessionId)}
@@ -360,7 +361,7 @@
         type="button"
         role="menuitem"
         class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
-        onclick={doRedo}>Redo {redoLabel(sessionId)}<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Ctrl+Shift+Z</span></button
+        onclick={doRedo}>Redo {redoLabel(sessionId)}<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Ctrl+Shift+Z")}</span></button
       >
     {/if}
   {/if}
@@ -398,7 +399,7 @@
       role="menuitem"
       class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
       onclick={goUp}
-      ><ArrowUpIcon class="size-3.5" /> Go Up<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Alt+Up</span></button
+      ><ArrowUpIcon class="size-3.5" /> Go Up<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Alt+Up")}</span></button
     >
   {/if}
   {#if isDirTarget()}
@@ -437,7 +438,7 @@
       role="menuitem"
       class="flex items-center gap-2 rounded-sm px-2 py-1 text-left text-[12px] hover:bg-accent"
       onclick={showInfo}
-      ><InfoIcon class="size-3.5" /> Info<span class="ml-auto pl-4 text-[11px] text-muted-foreground">Alt+Enter</span></button
+      ><InfoIcon class="size-3.5" /> Info<span class="ml-auto pl-4 text-[11px] text-muted-foreground">{formatShortcut("Alt+Enter")}</span></button
     >
   {/if}
 </div>

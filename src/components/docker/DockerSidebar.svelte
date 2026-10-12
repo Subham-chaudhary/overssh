@@ -1,6 +1,7 @@
 <script lang="ts">
   // Docker sidebar (docs/GUIDE.md §15.3.D): Compose projects, Containers (running/stopped),
   // Images, Volumes, Networks; filter box, counts, right-click and hover actions.
+  import { clipboardWrite } from "$lib/clipboard";
   import { onMount } from "svelte";
   import { dockerStore } from "$lib/docker/docker.svelte";
   import { projectServices, isRunning, formatBytes, type Container } from "$lib/docker/parse";
@@ -63,7 +64,7 @@
         { sep: true, label: "" },
         { label: "View logs", onclick: () => (dockerStore.tab.container = "logs") },
         { label: "Exec shell", disabled: !run, onclick: () => dockerStore.execShell(c) },
-        { label: "Copy ID", onclick: () => void navigator.clipboard?.writeText(c.id) },
+        { label: "Copy ID", onclick: () => void clipboardWrite(c.id) },
         { sep: true, label: "" },
         { label: "Remove…", danger: true, onclick: () => void removeAsk(c) },
       ],

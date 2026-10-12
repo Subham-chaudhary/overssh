@@ -1,5 +1,6 @@
 <script lang="ts">
   // Container environment. Values are masked until revealed (they often hold secrets).
+  import { clipboardWrite } from "$lib/clipboard";
   import type { ContainerInspect } from "$lib/docker/parse";
   import { isSecretKey } from "$lib/docker/parse";
   import { app } from "$lib/stores.svelte";
@@ -18,7 +19,7 @@
 
   async function copy(v: string): Promise<void> {
     try {
-      await navigator.clipboard.writeText(v);
+      await clipboardWrite(v);
       app.addToast("info", "Copied");
     } catch {
       app.addToast("error", "Clipboard access denied");

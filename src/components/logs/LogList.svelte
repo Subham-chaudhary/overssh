@@ -1,6 +1,7 @@
 <script lang="ts">
   // Lean virtualized log list (fixed row height; estimated heights when wrapping).
   // Only the rows in the viewport (+ overscan) exist in the DOM, so 100k lines stay smooth.
+  import { clipboardWrite } from "$lib/clipboard";
   import { onMount, tick } from "svelte";
   import { LEVEL_CLASS, splitTimestamp, type LogTab } from "$lib/logs.svelte";
 
@@ -170,7 +171,7 @@
   export function copySelection(): boolean {
     if (selected.size === 0) return false;
     const rows = [...selected].filter((a) => a >= tab.dropped).sort((a, b) => a - b);
-    void navigator.clipboard?.writeText(rows.map((a) => tab.line(a)).join("\n"));
+    void clipboardWrite(rows.map((a) => tab.line(a)).join("\n"));
     return true;
   }
 

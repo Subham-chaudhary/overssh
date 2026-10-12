@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { app } from "./lib/stores.svelte";
+  import { modKey } from "./lib/platform";
   import { isAppError, onSessionClosed } from "./lib/api";
   import { settings, DEFAULTS, appliedTheme } from "./lib/settings.svelte";
   import { refreshMonacoThemes } from "./lib/monaco";
@@ -511,7 +512,7 @@
    * win over Monaco/xterm consuming the same combo) first, then the browser
    * default-shortcut blocklist. Capture phase per §12.2. */
   function onWindowKeydownCapture(e: KeyboardEvent): void {
-    const mod = e.ctrlKey || e.metaKey;
+    const mod = modKey(e);
     const key = e.key.toLowerCase();
 
     if (tabSwitcher.active) {

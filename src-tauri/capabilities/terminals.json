@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "terminals",
   "description": "Capabilities for the detached terminal window",
-  "windows": ["terminals"],
+  "windows": [
+    "terminals"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
@@ -15,6 +17,8 @@
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-set-icon",
-    "core:image:allow-new"
+    "core:image:allow-new",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
   ]
 }

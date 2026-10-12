@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { clipboardRead, clipboardWrite } from "$lib/clipboard";
+  import { isMac, modKey } from "$lib/platform";
   import { onMount, onDestroy } from "svelte";
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
@@ -246,7 +248,7 @@
   async function pasteFromClipboard(): Promise<void> {
     let text: string;
     try {
-      text = await navigator.clipboard.readText();
+      text = await clipboardRead();
     } catch {
       app.addToast("error", "Clipboard access denied: cannot paste.");
       return;
@@ -278,7 +280,7 @@
     term = new XTerm({
       cursorBlink: true,
       cursorStyle: settings.terminal.cursorStyle,
-      fontFamily: "'Cascadia Code', Consolas, monospace",
+      fontFamily: "'Cascadia Code', Consolas, Menlo, 'SF Mono', 'DejaVu Sans Mono', 'Liberation Mono', monospace",
       fontSize: settings.terminal.fontSize,
       scrollback: 5000,
       allowProposedApi: true,
@@ -334,7 +336,14 @@
         hideGhost();
       }
 
-      const mod = e.ctrlKey || e.metaKey;
+      // macOS: Option+Backspace / Option+Delete delete a word (the Ctrl+ pair below
+      // on other platforms). Ctrl stays the shell's there; app shortcuts use Cmd.
+      if (isMac && e.type === "keydown" && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === "Backspace" || e.key === "Delete")) {
+        e.preventDefault();
+        term?.input(e.key === "Backspace" ? "\x17" : "\x1bd");
+        return false;
+      }
+      const mod = modKey(e);
       if (!mod) return true;
       // §12.2: these are App.svelte's (or the panel's) global shortcuts —
       // let them bubble to the window instead of xterm consuming them.
@@ -357,7 +366,7 @@
       if (key === "c") {
         const selection = term?.getSelection();
         if (selection) {
-          navigator.clipboard.writeText(selection).catch(() => app.addToast("error", "Clipboard access denied: cannot copy."));
+          clipboardWrite(selection).catch(() => app.addToast("error", "Clipboard access denied: cannot copy."));
           return false;
         }
         return true;
@@ -475,7 +484,7 @@
     padding: 0;
     white-space: pre;
     pointer-events: none;
-    font-family: 'Cascadia Code', Consolas, monospace;
+    font-family: 'Cascadia Code', Consolas, Menlo, 'SF Mono', 'DejaVu Sans Mono', 'Liberation Mono', monospace;
     color: var(--muted-foreground);
     opacity: 0.7;
     user-select: none;
