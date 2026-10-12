@@ -1022,3 +1022,42 @@ File-based and offline: no cloud, no account. One JSON file (or the same text on
 - **Sync / profiles**: imported forward rules auto-start only when they are local forwards bound to loopback (`safeAutoStart`); the preview warns about that and about terminal startup commands in workspace profiles. Opening a profile cannot start twice from a double click, and a damaged profile cannot leave a run stuck in "running".
 - **Tests**: UI scenarios 85 (rebase / cherry-pick banner) and 86 (transfer lost with the connection, retry after reconnect). Mock: `FakeRepo.gitDirEntries` + `g1GitDirList` (answers `list_dir` of `<repo>/.git`), `rebase|cherry-pick|revert --continue|--abort|--skip`.
 - **Known gaps**: `git am` vs `rebase --apply` needs one more `list_dir`; services/docker backoff counters are per mount (reset when the view remounts); monitor retry only covers streams still wanted by a mounted view.
+
+## 16. Platforms and releases
+
+OverSSH builds for Windows (x64), macOS (Apple Silicon and Intel) and Linux (x64).
+
+### 16.1 Release workflow
+
+- `.github/workflows/release.yml` runs when a tag `vX.Y.Z` is pushed (or by hand, with a tag input).
+- The `check` job runs `npm run check`, the unit tests and `cargo test` on Linux.
+- The `build` job uses `tauri-action` for each platform and uploads to a **draft** release:
+  - Windows: NSIS `.exe` and `.msi`.
+  - macOS: `.app` and `.dmg` for each architecture, ad-hoc signed (`signingIdentity: "-"`), not notarized.
+  - Linux: `.deb`, `.rpm` and `.AppImage`. Built on Ubuntu 22.04 against WebKitGTK 4.1.
+- The tag is the version. `scripts/set-version.mjs` writes it into `package.json`,
+  `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json` before the build.
+  Run the script locally too, so the files in the repo agree with the tag.
+- `bundle.targets` in `tauri.conf.json` stays `["nsis"]` for local Windows builds.
+  CI passes `--bundles` for each platform.
+
+To release: `node scripts/set-version.mjs 1.2.14`, commit, `git tag v1.2.14`, then push the tag.
+Publish the draft release when all four builds are attached.
+
+### 16.2 Platform rules
+
+- **Shortcuts:** use `modKey(e)` from `src/lib/platform.ts` for app shortcuts. It returns true
+  for Cmd on macOS and for Ctrl elsewhere. On macOS, Ctrl must reach the shell (Ctrl+W, Ctrl+B, ...).
+  In the terminal, Option+Backspace and Option+Delete delete a word on macOS.
+- **Shortcut labels:** write them as `"Ctrl+Shift+P"` and show them through `formatShortcut()`.
+  On macOS that function shows `⇧⌘P`.
+- **Clipboard:** use `clipboardRead` / `clipboardWrite` from `src/lib/clipboard.ts`, never
+  `navigator.clipboard` directly. They use `tauri-plugin-clipboard-manager`, because WebKit shows a
+  paste prompt for `readText` and can reject writes made after an `await`.
+- **Fonts:** font stacks name Windows, macOS and Linux fonts (`--font-ui`, `--font-mono`).
+- **Linux:** `lib.rs` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` unless the user has set it. Without it,
+  some NVIDIA and VM setups show a blank window. A missing tray icon does not stop the app.
+- **macOS:** the default app menu (Cmd+C/V/Q, ...) stays enabled. A click on the Dock icon shows a main
+  window that was hidden to the tray.
+- Local OS paths go through `std::path` in Rust. Code that is only for one OS uses
+  `#[cfg(windows)]`, `#[cfg(unix)]` or `#[cfg(target_os = "macos")]` (see `recording.rs` and `transfer.rs`).
