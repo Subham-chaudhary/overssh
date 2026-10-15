@@ -1136,5 +1136,40 @@ Rules:
   stream restarts in the applicable mode.
 - When the window is hidden for 30 s, all monitor streams stop. When the window is visible again, they
   start again.
+- The process details drawer (`ProcDetails`) reads `/proc/<pid>` every 5 s for the selected pid only, and
+  skips ticks while the window is hidden.
 - Cost grows linearly with the number of processes and with 1/interval. The 500 ms interval collects
   4 times as much data as the default 2 s.
+
+## 18. Closing the app and SSH channel limits
+
+### 18.1 Close guard (`src-tauri/src/closeguard.rs`)
+
+The app can close in these ways. Each way asks about unsaved files (`app.confirmQuit`):
+- **The title-bar close button.** The frontend asks, then calls `confirm_close`.
+- **Alt+F4, or the taskbar "Close window".** Rust prevents the close and sends `app://close-requested`.
+  The frontend asks, then calls `confirm_close`, so that the next close can continue. When hide-to-tray
+  applies (forwards are running and a tray icon exists), the window hides and no question is asked.
+- **The tray Quit.** The app shows the window and sends `app://quit-requested`. The frontend asks, then calls
+  `app_quit`, or `quit_cancelled` if the user cancels. If the user clicks Quit again while the first request
+  has no answer, the app quits immediately. Thus a page that does not respond cannot stop the app from
+  quitting.
+- **Cmd+Q on macOS** (the default app menu) does not go through the guard yet.
+
+### 18.2 Session channels
+
+The setting `MaxSessions` in sshd (10 by default) sets the limit of session channels in one connection.
+These items use the same channels: SFTP, each terminal, the monitor, log, Docker event and stats streams,
+and each short command. `Session::open_channel` tries again with a backoff for up to 6 s when the server
+refuses a channel with "administratively prohibited" or "resource shortage". After that, it gives an error
+that tells the user what to do.
+
+### 18.3 Rules from the bug hunt (`.claude/skills/tauri-bug-hunt`)
+
+- Monaco: use `editor.addAction` for keys in one editor. `addCommand` sets a global binding that stays after
+  the editor is closed.
+- Saves: send a snapshot of `tab.doc`, and then set `savedDoc` to that snapshot. Do not set `savedDoc` to
+  the live `tab.doc` after the `await`.
+- Git operations: bind the session and the repository when the operation is requested, not when it runs.
+- An async result that can arrive after the selection changed must use a sequence token.
+- `tests/unit/ipcContract.test.ts` keeps `api.ts` the same as the `#[tauri::command]` signatures.
