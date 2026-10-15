@@ -222,6 +222,10 @@ pub fn classify_sudo(stderr: &str) -> Option<&'static str> {
         || s.contains("a terminal is required")
         || s.contains("no tty present")
         || s.contains("askpass")
+        // `Defaults requiretty` (older RHEL/CentOS): "sudo: sorry, you must have a tty to run sudo"
+        || s.contains("must have a tty")
+        // sudo-rs (default sudo on newer Ubuntu) under `-n`: "interactive authentication is required"
+        || s.contains("interactive authentication is required")
     {
         Some("sudoPassword")
     } else if s.contains("sudo: not found") || s.contains("sudo: command not found") || s.contains("exec: sudo") {
@@ -796,6 +800,8 @@ mod tests {
         assert_eq!(classify_sudo("sudo: a password is required\n"), Some("sudoPassword"));
         assert_eq!(classify_sudo("sudo: a terminal is required to read the password"), Some("sudoPassword"));
         assert_eq!(classify_sudo("sudo: no tty present and no askpass program specified"), Some("sudoPassword"));
+        assert_eq!(classify_sudo("sudo: sorry, you must have a tty to run sudo"), Some("sudoPassword"));
+        assert_eq!(classify_sudo("sudo: interactive authentication is required"), Some("sudoPassword"));
         assert_eq!(classify_sudo("sh: 1: exec: sudo: not found"), Some("sudoMissing"));
         assert_eq!(classify_sudo("bob is not in the sudoers file."), Some("sudoDenied"));
         assert_eq!(classify_sudo("Failed to restart nginx.service: Unit not found."), None);

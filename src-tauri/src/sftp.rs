@@ -732,11 +732,19 @@ pub async fn write_file_sudo(
     Ok(meta.mtime.unwrap_or(0) as i64)
 }
 
+/// Open flags and attributes for the save-as-root temp file. The content is
+/// often a secret (`/etc/shadow`, a TLS key, a `.env`): with plain CREATE the
+/// server's umask made it world-readable in `/tmp` until `sudo` moved it. Mode
+/// 0600 keeps it private; EXCLUDE never writes through a planted file or link.
+fn private_temp_open() -> (OpenFlags, FileAttributes) {
+    let mut attrs = FileAttributes::empty();
+    attrs.permissions = Some(0o600);
+    (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE, attrs)
+}
+
 async fn upload_to_temp(session: &Session, tmp_path: &str, content: &str) -> Result<(), AppError> {
-    let mut file = session
-        .sftp
-        .open_with_flags(tmp_path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
-        .await?;
+    let (flags, attrs) = private_temp_open();
+    let mut file = session.sftp.open_with_flags_and_attributes(tmp_path, flags, attrs).await?;
     for piece in content.as_bytes().chunks(CHUNK_SIZE) {
         file.write_all(piece).await.map_err(|e| AppError::Io { message: e.to_string() })?;
     }
@@ -820,6 +828,15 @@ mod tests {
         assert!(is_inside("/a/b/", "/a/b/c"));
         assert!(!is_inside("/a/b", "/a/bc"));
         assert!(!is_inside("/a/b", "/a"));
+    }
+
+    #[test]
+    fn sudo_temp_file_is_private_and_new() {
+        use russh_sftp::protocol::OpenFlags;
+        let (flags, attrs) = super::private_temp_open();
+        assert_eq!(attrs.permissions, Some(0o600));
+        assert!(flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE));
+        assert!(!flags.contains(OpenFlags::TRUNCATE));
     }
 
     #[test]

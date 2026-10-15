@@ -70,7 +70,17 @@ pub fn build_command(path: &str, depth: u32) -> Result<String, AppError> {
            $N du -x -k -s \"${{P:-/}}\"; \
          fi"
     );
-    Ok(format!("sh -c {}", shell_quote(&script)))
+    let inner = format!("sh -c {}", shell_quote(&script));
+    // Own process group (setsid), so the watchdog stops the fallback loop and its current
+    // `du -s` too. Without the watchdog, a cancelled scan of a big tree keeps running on the
+    // VM: du writes little (one line per finished directory) and only dies on its next write.
+    let grouped = format!(
+        "sh -c {}",
+        shell_quote(&format!(
+            "if command -v setsid >/dev/null 2>&1; then exec setsid {inner}; else exec {inner}; fi"
+        ))
+    );
+    Ok(crate::docker::stream_wrap(&grouped))
 }
 
 /// Parses one `du -k` line: `<kb><TAB or space><path>`.
@@ -177,8 +187,8 @@ pub async fn du_start(
     let session = sessions.get(&session_id).await?;
     let cmd = build_command(&path, depth)?;
     let channel = session.open_channel().await?;
+    // No `eof` here: the watchdog in `stream_wrap` treats stdin EOF as "stop the scan".
     channel.exec(true, cmd.into_bytes()).await?;
-    let _ = channel.eof().await;
 
     let id = Uuid::new_v4().to_string();
     let (mut read_half, write_half) = channel.split();
@@ -303,6 +313,9 @@ mod tests {
         let c = build_command("/srv/it's here", 99).unwrap();
         assert!(c.starts_with("sh -c '"));
         assert!(c.contains("D=8"));
+        // cancel / disconnect must stop du on the VM (watchdog + own process group)
+        assert!(c.contains("wait $p"));
+        assert!(c.contains("exec setsid"));
         assert!(build_command("relative", 1).is_err());
     }
 }

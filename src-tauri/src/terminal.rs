@@ -10,6 +10,7 @@
 //! and the channel's end as `term://exit`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use russh::{Channel, ChannelMsg, ChannelWriteHalf};
@@ -376,9 +377,16 @@ pub async fn term_window_open(
             builder = builder.position(x, y);
         }
     }
-    builder
-        .build()
-        .map_err(|e| AppError::other(format!("could not open the terminal window: {e}")))?;
+    if let Err(e) = builder.build() {
+        // Two detaches in a row: the other call built the window first and the
+        // label is taken. That is a success, not an error toast.
+        if let Some(w) = app.get_webview_window(TERM_WINDOW) {
+            let _ = w.show();
+            let _ = w.set_focus();
+            return Ok(());
+        }
+        return Err(AppError::other(format!("could not open the terminal window: {e}")));
+    }
     Ok(())
 }
 
@@ -403,6 +411,15 @@ pub async fn term_window_close(app: AppHandle) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Bumped each time the terminal window is destroyed. The 3 s "force close"
+/// timer remembers the value it was armed with and does nothing if the window it
+/// was armed for is already gone (a new window may have the same label).
+static TERM_WIN_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn force_close_still_due(armed_gen: u64) -> bool {
+    TERM_WIN_GEN.load(Ordering::SeqCst) == armed_gen
+}
+
 /// Window events for the two windows involved. Called from `lib.rs`.
 ///
 /// - Closing the terminal window is intercepted: the page is asked (event
@@ -418,14 +435,19 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
             api.prevent_close();
             let _ = app.emit_to(TERM_WINDOW, "termwin://close-requested", ());
             let app2 = app.clone();
+            let armed_gen = TERM_WIN_GEN.load(Ordering::SeqCst);
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if !force_close_still_due(armed_gen) {
+                    return;
+                }
                 if let Some(w) = app2.get_webview_window(TERM_WINDOW) {
                     let _ = w.destroy();
                 }
             });
         }
         (TERM_WINDOW, tauri::WindowEvent::Destroyed) => {
+            TERM_WIN_GEN.fetch_add(1, Ordering::SeqCst);
             let _ = app.emit("termwin://gone", ());
         }
         ("main", tauri::WindowEvent::Destroyed) => {
@@ -480,7 +502,16 @@ fn decode_utf8_lossy_carry(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_utf8_lossy_carry, Scrollback, SCROLLBACK_CAP};
+    use super::{decode_utf8_lossy_carry, force_close_still_due, Scrollback, SCROLLBACK_CAP, TERM_WIN_GEN};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn stale_force_close_timer_does_not_hit_a_reopened_window() {
+        let armed = TERM_WIN_GEN.load(Ordering::SeqCst);
+        assert!(force_close_still_due(armed)); // window never answered: close it
+        TERM_WIN_GEN.fetch_add(1, Ordering::SeqCst); // window destroyed, a new one opens
+        assert!(!force_close_still_due(armed)); // the old timer must leave the new window alone
+    }
 
     #[test]
     fn scrollback_numbers_chunks_and_replays_in_order() {

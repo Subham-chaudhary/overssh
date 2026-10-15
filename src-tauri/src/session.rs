@@ -104,8 +104,32 @@ impl Session {
 
     /// Opens a fresh channel on the same TCP connection. Used by `terminal.rs`
     /// (task T4) to start PTYs without a second SSH handshake.
+    ///
+    /// sshd allows `MaxSessions` (default 10) session channels per connection.
+    /// Terminals, the SFTP subsystem, monitor/log/docker streams and short
+    /// commands share them, so a burst (a Docker refresh runs several commands
+    /// at once) can hit the limit. Short commands free their slot within
+    /// milliseconds, so a refused open is retried for a few seconds before
+    /// it fails with an explanation.
     pub async fn open_channel(&self) -> Result<Channel<Msg>, AppError> {
-        Ok(self.handle.channel_open_session().await?)
+        let mut delay = std::time::Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            match self.handle.channel_open_session().await {
+                Ok(ch) => return Ok(ch),
+                Err(e) if channel_limit_hit(&e) => {
+                    if std::time::Instant::now() + delay > deadline {
+                        return Err(AppError::Io {
+                            message: "The server refused another session channel. It allows a limited number per                                       connection (sshd MaxSessions, 10 by default). Close some terminals, log                                       streams or panels, or raise MaxSessions on the server."
+                                .into(),
+                        });
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Best-effort graceful shutdown: closes the SFTP subsystem then sends an
@@ -642,6 +666,7 @@ async fn authenticate(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum AuthOutcome {
     Success,
     NeedPassphrase,
@@ -658,16 +683,37 @@ async fn try_private_key(
     passphrase: Option<&str>,
     best_rsa_hash: Option<HashAlg>,
 ) -> AuthOutcome {
-    let key = match keys::load_secret_key(path, passphrase) {
-        Ok(key) => key,
-        Err(keys::Error::KeyIsEncrypted) => return AuthOutcome::NeedPassphrase,
-        Err(_) if passphrase.is_some() => return AuthOutcome::NeedPassphrase,
+    // File read + key-derivation (bcrypt for OpenSSH keys) is blocking CPU work.
+    let (owned_path, owned_pass) = (path.to_path_buf(), passphrase.map(str::to_string));
+    let loaded = tokio::task::spawn_blocking(move || load_key(&owned_path, owned_pass.as_deref())).await;
+    let key = match loaded {
+        Ok(Ok(key)) => key,
+        Ok(Err(outcome)) => return outcome,
         Err(_) => return AuthOutcome::Failed,
     };
     let key = PrivateKeyWithHashAlg::new(Arc::new(key), best_rsa_hash);
     match handle.authenticate_publickey(user, key).await {
         Ok(AuthResult::Success) => AuthOutcome::Success,
         _ => AuthOutcome::Failed,
+    }
+}
+
+/// Loads one private key file (blocking). A load that fails while a passphrase
+/// is set asks for a passphrase only when the file really is an encrypted key:
+/// a `.pub` file, an unsupported format or garbage is just skipped. Before, any
+/// such file asked for a passphrase again and again (the passphrase given for
+/// another key never "fixes" it), so the connect could never go on.
+fn load_key(path: &Path, passphrase: Option<&str>) -> Result<keys::PrivateKey, AuthOutcome> {
+    match keys::load_secret_key(path, passphrase) {
+        Ok(key) => Ok(key),
+        Err(keys::Error::KeyIsEncrypted) => Err(AuthOutcome::NeedPassphrase),
+        Err(_) if passphrase.is_some() => match keys::load_secret_key(path, None) {
+            Ok(key) => Ok(key),
+            // Encrypted, and the passphrase given did not decrypt it.
+            Err(keys::Error::KeyIsEncrypted) => Err(AuthOutcome::NeedPassphrase),
+            Err(_) => Err(AuthOutcome::Failed),
+        },
+        Err(_) => Err(AuthOutcome::Failed),
     }
 }
 
@@ -869,8 +915,28 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// A channel open refused because the connection has no free session slot
+/// (OpenSSH answers "administratively prohibited" past MaxSessions).
+fn channel_limit_hit(e: &russh::Error) -> bool {
+    matches!(
+        e,
+        russh::Error::ChannelOpenFailure(
+            russh::ChannelOpenFailure::AdministrativelyProhibited | russh::ChannelOpenFailure::ResourceShortage
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_limit_refusals_are_retried_others_are_not() {
+        use russh::ChannelOpenFailure as F;
+        assert!(channel_limit_hit(&russh::Error::ChannelOpenFailure(F::AdministrativelyProhibited)));
+        assert!(channel_limit_hit(&russh::Error::ChannelOpenFailure(F::ResourceShortage)));
+        assert!(!channel_limit_hit(&russh::Error::ChannelOpenFailure(F::ConnectFailed)));
+        assert!(!channel_limit_hit(&russh::Error::Disconnect));
+    }
+
     use super::*;
 
     fn j(user: Option<&str>, host: &str, port: Option<u16>) -> JumpSpec {
@@ -904,6 +970,50 @@ mod tests {
             vec![j(Some("u"), "::1", Some(2200))]
         );
         assert_eq!(parse_jump_chain("[fe80::1]").unwrap(), vec![j(None, "fe80::1", None)]);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("overssh-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn non_key_files_never_ask_for_a_passphrase() {
+        let dir = temp_dir("keys");
+        let pubfile = dir.join("id_ed25519.pub");
+        std::fs::write(
+            &pubfile,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test\n",
+        )
+        .unwrap();
+        let garbage = dir.join("garbage");
+        std::fs::write(&garbage, "not a key").unwrap();
+        for p in [&pubfile, &garbage] {
+            // A passphrase entered for another key must not turn these into a prompt.
+            assert_eq!(load_key(p, Some("for-another-key")).err(), Some(AuthOutcome::Failed), "{p:?}");
+            assert_eq!(load_key(p, None).err(), Some(AuthOutcome::Failed), "{p:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encrypted_key_asks_until_the_right_passphrase() {
+        let dir = temp_dir("enc");
+        let key = dir.join("k");
+        // Generated at test time (no key material in the repo); skipped without ssh-keygen.
+        let made = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "right", "-f"])
+            .arg(&key)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(load_key(&key, None).err(), Some(AuthOutcome::NeedPassphrase));
+        assert_eq!(load_key(&key, Some("wrong")).err(), Some(AuthOutcome::NeedPassphrase));
+        assert!(load_key(&key, Some("right")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

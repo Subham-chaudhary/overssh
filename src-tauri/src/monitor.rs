@@ -163,7 +163,7 @@ echo "@@uptime"; cat /proc/uptime 2>/dev/null
 echo "@@meminfo"; cat /proc/meminfo 2>/dev/null
 echo "@@net"; cat /proc/net/dev 2>/dev/null
 if [ $((n % 10)) -eq 0 ]; then
-echo "@@df"; df -Pkl 2>/dev/null || df -Pk 2>/dev/null
+echo "@@df"; __DF__
 fi
 n=$((n + 1))
 if [ __PROCS__ = 1 ]; then
@@ -182,9 +182,17 @@ d=__INTERVAL__
 done
 "#;
 
+/// `df -Pkl` exits 1 after printing its table when it cannot stat one mount (the
+/// `/run/user/N/doc` FUSE mount on desktop Ubuntu does that). `a || b` would then run the
+/// fallback as well and append a second table (every disk twice, and network mounts that
+/// `-l` leaves out). The fallback runs only when the first call printed nothing (busybox
+/// without `-l`).
+const DF_SNIPPET: &str = r#"o=$(df -Pkl 2>/dev/null); [ -n "$o" ] || o=$(df -Pk 2>/dev/null); echo "$o""#;
+
 fn build_script(interval_ms: u64, threads: bool, procs: bool) -> String {
     let ms = interval_ms.clamp(250, 60_000);
     SCRIPT_TEMPLATE
+        .replace("__DF__", DF_SNIPPET)
         .replace("__INTERVAL__", &format!("{}.{:03}", ms / 1000, ms % 1000))
         .replace("__THREADS__", if threads && procs { "1" } else { "0" })
         .replace("__PROCS__", if procs { "1" } else { "0" })
@@ -798,6 +806,12 @@ const SIGNALS: [&str; 12] = [
     "TERM", "KILL", "HUP", "INT", "QUIT", "USR1", "USR2", "STOP", "CONT", "ALRM", "PIPE", "TSTP",
 ];
 
+/// pid 0 (own process group) and values that wrap to a negative pid (-1 = every process)
+/// must never reach `kill`/`renice`.
+fn valid_pid(pid: u32) -> bool {
+    (1..=i32::MAX as u32).contains(&pid)
+}
+
 pub fn validate_signal(sig: &str) -> Option<&'static str> {
     let up = sig.trim().to_ascii_uppercase();
     let s = up.strip_prefix("SIG").unwrap_or(&up);
@@ -851,6 +865,9 @@ pub async fn proc_kill(
     signal: String,
 ) -> Result<(), AppError> {
     let sig = validate_signal(&signal).ok_or_else(|| AppError::config(format!("unsupported signal: {signal}")))?;
+    if !valid_pid(pid) {
+        return Err(AppError::config("invalid pid"));
+    }
     let session = sessions.get(&session_id).await?;
     run_exec(&session, format!("kill -s {sig} {pid}")).await
 }
@@ -867,6 +884,9 @@ pub async fn proc_kill_many(
     if pids.is_empty() || pids.len() > 500 {
         return Err(AppError::config("between 1 and 500 pids expected"));
     }
+    if !pids.iter().all(|p| valid_pid(*p)) {
+        return Err(AppError::config("invalid pid"));
+    }
     let list: Vec<String> = pids.iter().map(u32::to_string).collect();
     let session = sessions.get(&session_id).await?;
     run_exec(&session, format!("kill -s {sig} {}", list.join(" "))).await
@@ -882,6 +902,9 @@ pub async fn proc_renice(
 ) -> Result<(), AppError> {
     if !(-20..=19).contains(&nice) {
         return Err(AppError::config("nice must be between -20 and 19"));
+    }
+    if !valid_pid(pid) {
+        return Err(AppError::config("invalid pid"));
     }
     let session = sessions.get(&session_id).await?;
     run_exec(&session, format!("renice -n {nice} -p {pid}")).await
@@ -1285,6 +1308,41 @@ mod tests {
         assert_eq!(validate_signal("term"), Some("TERM"));
         assert_eq!(validate_signal("SIGKILL"), Some("KILL"));
         assert_eq!(validate_signal("9; rm -rf /"), None);
+    }
+
+    #[test]
+    fn pid_bounds() {
+        assert!(!valid_pid(0));
+        assert!(valid_pid(1));
+        assert!(valid_pid(4_194_304));
+        assert!(!valid_pid(u32::MAX)); // would reach `kill` as -1
+    }
+
+    /// `df -Pkl` that prints its table and exits 1 (unreadable FUSE mount) must not
+    /// trigger the `df -Pk` fallback and a second table.
+    #[test]
+    fn df_fallback_only_when_first_call_printed_nothing() {
+        use std::process::Command;
+        let run = |fake: &str| -> Option<String> {
+            let script = format!("df() {{ {fake}; }}\n{DF_SNIPPET}");
+            let out = Command::new("sh").args(["-c", &script]).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let table = "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'; echo '/dev/sda1 1000 400 600 40% /'";
+        // partial failure: table on stdout, error on stderr, exit 1
+        let Some(out) = run(&format!(
+            "if [ \"$1\" = -Pkl ]; then {table}; echo 'df: /run/user/1000/doc: Operation not permitted' >&2; return 1; else {table}; echo 'srv:/x 5 1 4 1% /mnt/nfs'; fi"
+        )) else {
+            return; // no sh on this host
+        };
+        if out.is_empty() {
+            return; // sh could not run the snippet here
+        }
+        assert_eq!(parse_df(&out).len(), 1, "{out}");
+        // busybox without -l: first call prints nothing, the fallback must run
+        let out = run(&format!("if [ \"$1\" = -Pkl ]; then return 1; else {table}; fi")).unwrap();
+        assert_eq!(parse_df(&out).len(), 1, "{out}");
+        assert!(build_script(2000, false, false).contains(DF_SNIPPET));
     }
 
     #[test]

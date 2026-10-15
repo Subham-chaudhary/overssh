@@ -214,7 +214,28 @@ fn parse_line(line: &str) -> (String, String) {
     if let Some(r) = rest.strip_prefix('=') {
         rest = r.trim_start();
     }
+    // OpenSSH ends the line at an unquoted `#` that starts a word, so
+    // `Port 2222 # staging` is port 2222. ProxyCommand keeps the whole line.
+    if !key.eq_ignore_ascii_case("proxycommand") {
+        rest = strip_trailing_comment(rest);
+    }
     (key, unquote(rest).to_string())
+}
+
+/// Cuts `s` at the first `#` that is outside double quotes and at the start of
+/// a word (`a#b` is not a comment).
+fn strip_trailing_comment(s: &str) -> &str {
+    let mut in_quote = false;
+    let mut prev_ws = true;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_quote = !in_quote,
+            '#' if !in_quote && prev_ws => return s[..i].trim_end(),
+            _ => {}
+        }
+        prev_ws = c.is_whitespace();
+    }
+    s
 }
 
 /// Remove surrounding double quotes if present.
@@ -295,16 +316,10 @@ fn expand_path_simple(path: &str) -> String {
 
 /// Expand ~ and %d in config values (used for HostName, IdentityFile, etc).
 fn expand_path(path: &str) -> String {
-    if path.starts_with("~/") {
+    // `~/` (and `~\` for Windows users). `~user` is not expanded.
+    if path.starts_with("~/") || path.starts_with("~\\") {
         if let Some(home) = get_home_dir() {
             return format!("{}{}", home, &path[1..]);
-        }
-    } else if path.starts_with("~") && path.len() > 1 {
-        // ~/ or ~user (but we don't expand ~user)
-        if path.starts_with("~/") {
-            if let Some(home) = get_home_dir() {
-                return format!("{}{}", home, &path[1..]);
-            }
         }
     }
 
@@ -685,6 +700,35 @@ Host !staging.example.com
         assert_eq!(a.port, 2222);
         assert_eq!(parse_line("  User = bob  "), ("User".into(), "bob".into()));
         assert_eq!(parse_line("HostName\t\"10.0.0.1\""), ("HostName".into(), "10.0.0.1".into()));
+    }
+
+    #[test]
+    fn test_trailing_comments_are_not_part_of_the_value() {
+        let text = r#"Host web # production
+    HostName 10.0.0.5 # primary
+    Port 2222 # custom
+    User "a # b" # why
+    IdentityFile ~/my#key # k
+    ProxyCommand ssh -W %h:%p gw # keep
+"#;
+        let c = parse_str(text, Path::new("."));
+        assert_eq!(c.concrete_hosts(), vec!["web".to_string()]);
+        let r = c.resolve("web");
+        assert_eq!(r.hostname, "10.0.0.5");
+        assert_eq!(r.port, 2222);
+        assert_eq!(r.user.as_deref(), Some("a # b"));
+        assert!(r.identity_files[0].ends_with("my#key"));
+        assert_eq!(r.proxy_command.as_deref(), Some("ssh -W %h:%p gw # keep"));
+    }
+
+    #[test]
+    fn test_windows_tilde_identity_file() {
+        let c = parse_str(r"Host t
+    IdentityFile ~\.ssh\id_ed25519
+", Path::new("."));
+        let f = &c.resolve("t").identity_files[0];
+        assert!(!f.starts_with('~'), "{f}");
+        assert!(f.ends_with("id_ed25519"));
     }
 
     #[test]

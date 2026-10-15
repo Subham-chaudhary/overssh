@@ -167,7 +167,10 @@ pub fn build_command(req: &SearchRequest) -> Result<String, AppError> {
          else echo '##grep'; exec {grep}; fi",
         root = shell_quote(&req.root),
     );
-    Ok(format!("sh -c {}", shell_quote(&script)))
+    // The watchdog kills rg/grep when the channel closes (cancel, closed panel, dropped
+    // connection). Without it a search with few matches keeps walking the tree on the VM:
+    // it only learns that the pipe is gone when it next writes.
+    Ok(crate::docker::stream_wrap(&format!("sh -c {}", shell_quote(&script))))
 }
 
 /// Joins the search root with a `./`-relative path from the tool output.
@@ -292,8 +295,8 @@ pub async fn search_start(
     let root = if root.is_empty() { "/".to_string() } else { root };
 
     let channel = session.open_channel().await?;
+    // No `eof` here: the watchdog in `stream_wrap` treats stdin EOF as "stop the search".
     channel.exec(true, cmd.into_bytes()).await?;
-    let _ = channel.eof().await;
 
     let id = Uuid::new_v4().to_string();
     let (mut read_half, write_half) = channel.split();
@@ -502,6 +505,15 @@ mod tests {
         assert!(!cmd.contains("-e 'it's'"));
         assert!(cmd.contains("--include="));
         assert!(cmd.contains("node_modules"));
+        assert!(cmd.contains("command -v rg"));
+    }
+
+    #[test]
+    fn search_runs_under_the_stream_watchdog() {
+        // Cancel / disconnect closes the channel; the watchdog must then stop rg/grep.
+        let cmd = build_command(&req()).unwrap();
+        assert!(cmd.starts_with("sh -c 'exec 3<&0; "), "{cmd}");
+        assert!(cmd.contains("wait $p"));
         assert!(cmd.contains("command -v rg"));
     }
 

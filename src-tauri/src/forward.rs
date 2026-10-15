@@ -146,6 +146,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
     }
 }
 
+/// Decrements `active` when dropped, so a pump that is cancelled (its forward
+/// was stopped) is not counted as active forever.
+struct ActiveGuard(Arc<ForwardStats>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Pump bytes both ways between a local socket and an SSH channel stream until
 /// either side closes.
 async fn pump<R>(local: TcpStream, mut remote: R, stats: Arc<ForwardStats>)
@@ -155,9 +165,38 @@ where
     let _ = local.set_nodelay(true);
     stats.total.fetch_add(1, Ordering::Relaxed);
     stats.active.fetch_add(1, Ordering::Relaxed);
-    let mut local = CountingStream { inner: local, stats: stats.clone() };
+    let _active = ActiveGuard(stats.clone());
+    let mut local = CountingStream { inner: local, stats };
     let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
-    stats.active.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Resolves once the forward is stopped (`true` was sent, or the sender is gone).
+async fn stopped(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// [`pump`], but it also ends (dropping both sockets, which closes the SSH
+/// channel) as soon as the forward is stopped. Without this, "Stop" only closed
+/// the listener and every connection already open kept flowing.
+async fn pump_until_stopped<R>(
+    local: TcpStream,
+    remote: R,
+    stats: Arc<ForwardStats>,
+    mut stop: watch::Receiver<bool>,
+) where
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::select! {
+        _ = pump(local, remote, stats) => {}
+        _ = stopped(&mut stop) => {}
+    }
 }
 
 /// How long a new tunnelled connection may take to open (server `direct-tcpip`
@@ -180,6 +219,8 @@ pub struct RemoteRoute {
     pub target_port: u16,
     pub forward_id: String,
     pub stats: Arc<ForwardStats>,
+    /// Set to `true` when the forward is stopped; open connections end then.
+    pub stop: watch::Receiver<bool>,
 }
 
 /// Per-session table of active `-R` forwards. Owned by `Session`, shared with
@@ -218,7 +259,7 @@ pub async fn accept_remote(
         match connected {
             Ok(local) => {
                 reply.accept().await;
-                pump(local, channel.into_stream(), route.stats.clone()).await;
+                pump_until_stopped(local, channel.into_stream(), route.stats.clone(), route.stop.clone()).await;
             }
             Err(e) => {
                 route.stats.set_error(format!(
@@ -653,6 +694,7 @@ async fn start(
                                 let s = task_session.clone();
                                 let st = task_stats.clone();
                                 let host = target_host.clone();
+                                let conn_stop = stop_rx.clone();
                                 tokio::spawn(async move {
                                     let mut socket = socket;
                                     let (host, port, socks_version) = if dynamic {
@@ -692,7 +734,7 @@ async fn start(
                                                     return;
                                                 }
                                             }
-                                            pump(socket, channel.into_stream(), st).await
+                                            pump_until_stopped(socket, channel.into_stream(), st, conn_stop).await
                                         }
                                         Err(e) => {
                                             if let Some(v) = socks_version {
@@ -736,6 +778,7 @@ async fn start(
                 target_port: spec.target_port,
                 forward_id: id.clone(),
                 stats: stats.clone(),
+                stop: stop_rx.clone(),
             };
             // Register first: the server may open a channel right after it replies.
             session
@@ -880,6 +923,40 @@ mod tests {
         assert_eq!(stats.active.load(Ordering::Relaxed), 0);
         assert_eq!(stats.bytes_out.load(Ordering::Relaxed), 5);
         assert_eq!(stats.bytes_in.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_forward_ends_open_connections() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_remote_far, remote_near) = tokio::io::duplex(1024);
+        let stats = Arc::new(ForwardStats::default());
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let st = stats.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            pump_until_stopped(sock, remote_near, st, stop_rx).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Wait until the connection is counted as active.
+        for _ in 0..100 {
+            if stats.active.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(stats.active.load(Ordering::Relaxed), 1);
+
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server).await.expect("pump must end").unwrap();
+        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+        // The client sees the connection closed.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await.unwrap().unwrap_or(0);
+        assert_eq!(n, 0);
     }
 
     #[test]

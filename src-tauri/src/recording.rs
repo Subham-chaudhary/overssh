@@ -184,6 +184,19 @@ fn lock(slot: &RecSlot) -> MutexGuard<'_, RecState> {
     slot.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Puts `recorder` into the slot. If a recording is already running (a second
+/// `rec_start` raced past the first check), gives the new recorder back with
+/// the running file's path instead of replacing it.
+fn install_recorder(slot: &RecSlot, recorder: Recorder) -> Result<u64, (String, Recorder)> {
+    let mut st = lock(slot);
+    if let Some(running) = st.recorder.as_ref() {
+        return Err((running.path.to_string_lossy().into_owned(), recorder));
+    }
+    st.generation += 1;
+    st.recorder = Some(recorder);
+    Ok(st.generation)
+}
+
 /// Records PTY output if a recording is running. Returns `false` when the
 /// recording just died from a write error (it is dropped).
 pub fn record_output(slot: &RecSlot, data: &str) -> bool {
@@ -291,11 +304,14 @@ pub async fn rec_start(
     let recorder = recorder.ok_or_else(|| AppError::Io { message: "could not pick a free recording file name".into() })?;
     let path = recorder.path.to_string_lossy().into_owned();
 
-    let generation = {
-        let mut st = lock(&slot);
-        st.generation += 1;
-        st.recorder = Some(recorder);
-        st.generation
+    let generation = match install_recorder(&slot, recorder) {
+        Ok(g) => g,
+        Err((running, extra)) => {
+            // Lost the race: remove the file we just made and report the running one.
+            drop(extra);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Ok(running);
+        }
     };
 
     // Periodic flush, so a crash loses at most ~2 s and quiet terminals still
@@ -342,14 +358,40 @@ pub struct RecInfo {
     pub size: u64,
 }
 
-/// Reads the last non-empty line of a file (looks at its final 8 KiB).
+/// Largest tail `last_line` will read looking for the start of the last line.
+const MAX_TAIL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads the last non-empty line of a file. One event line can be far longer
+/// than a fixed window (a 32 KB output chunk is 32 KB+ of JSON), so the window
+/// grows until it contains the whole line (or hits `MAX_TAIL_BYTES`).
 fn last_line(f: &mut File, len: u64) -> Option<String> {
-    let take = len.min(8192);
-    f.seek(SeekFrom::Start(len - take)).ok()?;
-    let mut buf = Vec::new();
-    f.take(take).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    text.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.to_string())
+    let mut take = 8192u64;
+    loop {
+        let t = len.min(take);
+        f.seek(SeekFrom::Start(len - t)).ok()?;
+        let mut buf = Vec::new();
+        (&mut *f).take(t).read_to_end(&mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(i) = trimmed.rfind('\n') {
+            return Some(trimmed[i + 1..].to_string());
+        }
+        if t >= len || t >= MAX_TAIL_BYTES {
+            return Some(trimmed.to_string());
+        }
+        take = take.saturating_mul(8);
+    }
+}
+
+/// The `elapsed` number of an event line `[elapsed, "o", "..."]`. Reads only
+/// the start of the line, so a line cut short by a crash still gives a time.
+fn parse_elapsed(line: &str) -> Option<f64> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let end = rest.find(',')?;
+    rest[..end].trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 fn info_for(path: &Path) -> Option<RecInfo> {
@@ -370,10 +412,7 @@ fn info_for(path: &Path) -> Option<RecInfo> {
             meta.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
         })
         .unwrap_or(0);
-    let duration = last_line(&mut f, meta.len())
-        .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
-        .and_then(|v| v.get(0)?.as_f64())
-        .unwrap_or(0.0);
+    let duration = last_line(&mut f, meta.len()).and_then(|l| parse_elapsed(&l)).unwrap_or(0.0);
     let name = path.file_name()?.to_string_lossy().into_owned();
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     Some(RecInfo {
@@ -535,6 +574,48 @@ mod tests {
         assert_eq!(info.size, text.len() as u64);
         // Creating the same name again must not clobber it.
         assert!(Recorder::create(path.clone(), 80, 24, "x", "/bin/sh").is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("overssh-rec-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn duration_survives_a_last_event_longer_than_the_tail_window() {
+        let dir = temp_dir();
+        let path = dir.join("web-1-20231114-221320.cast");
+        let mut text = header_line(80, 24, 1_700_000_000, "web-1", "xterm-256color", "/bin/sh");
+        text.push('\n');
+        text.push_str(&event_line(1.5, "o", "hi"));
+        text.push('\n');
+        text.push_str(&event_line(42.25, "o", &"x".repeat(100_000)));
+        text.push('\n');
+        fs::write(&path, &text).unwrap();
+        let info = info_for(&path).unwrap();
+        assert_eq!(info.duration, 42.25);
+        // A line cut short by a crash still gives its time.
+        fs::write(&path, format!("{}\n[7.5,\"o\",\"par", text.lines().next().unwrap())).unwrap();
+        assert_eq!(info_for(&path).unwrap().duration, 7.5);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn second_recorder_does_not_replace_a_running_one() {
+        let dir = temp_dir();
+        let slot = new_slot(80, 24, "t".into());
+        let a = Recorder::create(dir.join("a.cast"), 80, 24, "t", "/bin/sh").unwrap();
+        let b = Recorder::create(dir.join("b.cast"), 80, 24, "t", "/bin/sh").unwrap();
+        let first = install_recorder(&slot, a);
+        assert!(first.is_ok());
+        match install_recorder(&slot, b) {
+            Err((running, _extra)) => assert!(running.ends_with("a.cast")),
+            Ok(_) => panic!("the running recording was replaced"),
+        }
+        assert!(lock(&slot).recorder.as_ref().unwrap().path.ends_with("a.cast"));
+        finish(&slot);
         fs::remove_dir_all(&dir).unwrap();
     }
 

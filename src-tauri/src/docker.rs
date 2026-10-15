@@ -73,9 +73,15 @@ pub fn build_command(command: Option<&str>, args: &[String]) -> Result<String, A
 /// EOF (an exec channel without a PTY does not always signal the process on
 /// close, and `docker events` may never write again to notice). A command that
 /// leads its own process group (`setsid`) is stopped as a group.
+///
+/// The watchdog's `cat` must not keep the channel's stdout/stderr pipes open:
+/// when the command ends by itself, `kill $w` only stops the subshell and the
+/// `cat` lives on (it waits for stdin EOF). sshd closes the channel only after
+/// both pipes reach EOF, so an inherited stderr would hold the channel open and
+/// the reader would never see the end of the stream.
 pub fn stream_wrap(cmd: &str) -> String {
     let script = format!(
-        "exec 3<&0; {cmd} </dev/null & p=$!; {{ cat <&3 >/dev/null; kill -- -$p 2>/dev/null || kill $p 2>/dev/null; }} & w=$!; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc"
+        "exec 3<&0; {cmd} </dev/null & p=$!; {{ cat <&3; kill -- -$p 2>/dev/null || kill $p 2>/dev/null; }} >/dev/null 2>&1 & w=$!; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc"
     );
     format!("sh -c {}", sh_quote(&script))
 }
@@ -583,6 +589,43 @@ mod tests {
         assert!(w.starts_with("sh -c '"));
         assert!(w.contains("docker '\\''events'\\''"));
         assert!(w.contains("wait $p"));
+    }
+
+    /// Runs the wrapper in a local `sh` whose stdin stays open (like an SSH exec
+    /// channel). When the command ends, stdout/stderr must reach EOF at once;
+    /// before the fix the watchdog `cat` kept stderr open until stdin closed.
+    #[test]
+    fn stream_wrap_releases_pipes_when_command_ends() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        if !Command::new("sh").args(["-c", "exit 0"]).status().is_ok_and(|s| s.success()) {
+            return; // no sh on this host
+        }
+        let wrapped = stream_wrap("echo hi");
+        // Real run: keep stdin open, read stderr and stdout to EOF.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let stdin = child.stdin.take().unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut err = child.stderr.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            let mut e = String::new();
+            let _ = err.read_to_string(&mut e);
+            let _ = tx.send(s);
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        drop(stdin); // lets the watchdog `cat` finish
+        let _ = child.wait();
+        assert_eq!(got.expect("pipes still open after the command ended").trim(), "hi");
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub const MAX_LINE_BYTES: usize = 256 * 1024;
 /// Output kept from the one-shot `logs_discover` probe.
 const DISCOVER_CAP: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogSource {
     /// "file" | "journal" | "docker" | "command"
@@ -42,6 +42,23 @@ pub struct LogSource {
     pub lines: Option<u32>,
     pub sudo: Option<bool>,
     pub password: Option<String>,
+}
+
+/// Hand-written so a `{:?}` of a source (a log line, a panic message) can never print the
+/// sudo password.
+impl std::fmt::Debug for LogSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogSource")
+            .field("kind", &self.kind)
+            .field("path", &self.path)
+            .field("unit", &self.unit)
+            .field("container", &self.container)
+            .field("command", &self.command)
+            .field("lines", &self.lines)
+            .field("sudo", &self.sudo)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 struct StreamHandle {
@@ -88,10 +105,10 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// A unit / container name must not contain whitespace; it is quoted anyway,
-/// this just rejects obviously wrong input.
+/// A unit / container name must not contain whitespace and must not look like an option
+/// (`docker logs -f --tail 5 -t '-x'` would take it as a flag). It is quoted anyway.
 fn valid_name(s: &str) -> bool {
-    !s.is_empty() && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+    !s.is_empty() && !s.starts_with('-') && !s.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// Builds the remote command line for a source (without the sudo wrapper).
@@ -342,6 +359,12 @@ pub struct Discovered {
 
 const DISCOVER_SCRIPT: &str = "echo '##files'; for f in /var/log/syslog /var/log/messages /var/log/auth.log /var/log/secure /var/log/kern.log /var/log/nginx/error.log /var/log/nginx/access.log /var/log/apache2/error.log /var/log/httpd/error_log; do [ -r \"$f\" ] && echo \"$f\"; done; echo '##docker'; docker ps --format '{{.Names}}' 2>/dev/null; echo '##units'; systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' | head -200; true";
 
+/// The probe as an exec command line. The script is POSIX sh (`for … do … done`), which
+/// fish or csh login shells reject as a whole, so it always goes through `sh -c`.
+fn discover_command() -> String {
+    format!("sh -c {}", shell_quote(DISCOVER_SCRIPT))
+}
+
 fn parse_discovered(text: &str) -> Discovered {
     let mut d = Discovered { files: vec![], containers: vec![], units: vec![] };
     let mut section = "";
@@ -370,7 +393,7 @@ pub async fn logs_discover(
 ) -> Result<Discovered, AppError> {
     let session: Arc<Session> = sessions.get(&session_id).await?;
     let mut channel = session.open_channel().await?;
-    channel.exec(true, DISCOVER_SCRIPT.as_bytes().to_vec()).await?;
+    channel.exec(true, discover_command().into_bytes()).await?;
     let mut out = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(msg) = channel.wait().await {
@@ -502,6 +525,30 @@ mod tests {
     #[test]
     fn sudo_wraps_and_quotes() {
         assert_eq!(sudo_wrap("tail -F 'a'"), r"sudo -S -p '' sh -c 'tail -F '\''a'\'''");
+    }
+
+    #[test]
+    fn discover_runs_under_sh_and_names_cannot_be_options() {
+        let c = discover_command();
+        assert!(c.starts_with("sh -c '") && c.ends_with('\''));
+        // the script contains single quotes ('##files'): they must be escaped inside the wrapper
+        assert!(c.contains(r"echo '\''##files'\''"), "{c}");
+        let mut d = src("docker");
+        d.container = Some("--help".into());
+        assert!(build_command(&d).is_err());
+        let mut j = src("journal");
+        j.unit = Some("-x".into());
+        assert!(build_command(&j).is_err());
+    }
+
+    #[test]
+    fn debug_never_prints_the_sudo_password() {
+        let mut s = src("file");
+        s.sudo = Some(true);
+        s.password = Some("hunter2".into());
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(dbg.contains("redacted"));
     }
 
     #[test]

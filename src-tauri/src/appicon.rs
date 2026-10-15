@@ -19,8 +19,12 @@ mod win {
 
     /// RGBA (straight alpha) -> HICON, as tao does: BGRA colour bits plus an AND mask.
     fn create_icon(rgba: &[u8], width: u32, height: u32) -> Option<HICON> {
+        // Check the size first: `width * height` overflows u32 (a debug-build panic) for huge input.
+        if width == 0 || height == 0 || width > 512 || height > 512 {
+            return None;
+        }
         let n = (width * height) as usize;
-        if width == 0 || height == 0 || width > 512 || height > 512 || rgba.len() != n * 4 {
+        if rgba.len() != n * 4 {
             return None;
         }
         let mut bgra = rgba.to_vec();

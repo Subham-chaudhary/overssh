@@ -162,6 +162,27 @@ fn local_basename(path: &str) -> Option<String> {
     Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
+/// Destination files already claimed by a job. Two sources must never map to
+/// one destination file: the parallel workers would write it at the same time
+/// (mixed content). That happens with two picked items of the same name, and
+/// on a case-insensitive local disk (Windows) with remote `README` + `readme`.
+pub struct DestFiles {
+    fold_case: bool,
+    seen: std::collections::HashSet<String>,
+}
+
+impl DestFiles {
+    pub fn new(fold_case: bool) -> Self {
+        Self { fold_case, seen: Default::default() }
+    }
+
+    /// `false` when `rel` (a destination file) is already taken.
+    pub fn claim(&mut self, rel: &str) -> bool {
+        let key = if self.fold_case { rel.to_lowercase() } else { rel.to_string() };
+        self.seen.insert(key)
+    }
+}
+
 fn join_rel(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
@@ -506,11 +527,41 @@ impl Endpoint {
         }
     }
 
-    /// Creates `path` if missing; an existing directory is fine, an existing file is not.
+    /// Follows symlinks: `Some(true)` for a folder or a link to one, `None` when
+    /// nothing (or a dangling link) is there. A folder reached through a symlink
+    /// (`~/www -> /srv/www`, a Windows junction) is a valid place to write into.
+    async fn is_dir_follow(&self, path: &str) -> Result<Option<bool>, AppError> {
+        match self {
+            Endpoint::Local => match tokio::fs::metadata(path).await {
+                Ok(m) => Ok(Some(m.is_dir())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(io_err(e)),
+            },
+            Endpoint::Remote(s) => match s.sftp.metadata(path).await {
+                Ok(m) => Ok(Some(m.is_dir())),
+                Err(e) => match AppError::from(e) {
+                    AppError::NotFound { .. } => Ok(None),
+                    other => Err(other),
+                },
+            },
+        }
+    }
+
+    /// The job's destination must be an existing folder (or a link to one).
+    async fn check_dest(&self, dest: &str) -> Result<(), AppError> {
+        match self.is_dir_follow(dest).await? {
+            Some(true) => Ok(()),
+            Some(false) => Err(AppError::conflict(format!("{dest} is not a folder"))),
+            None => Err(AppError::not_found(format!("destination {dest} does not exist"))),
+        }
+    }
+
+    /// Creates `path` if missing; an existing directory (or a link to one) is
+    /// fine, an existing file is not.
     async fn mkdir(&self, path: &str) -> Result<(), AppError> {
-        match self.stat(path).await? {
-            Some(s) if s.is_dir => Ok(()),
-            Some(_) => Err(AppError::conflict(format!("{path} exists and is not a folder"))),
+        match self.is_dir_follow(path).await? {
+            Some(true) => Ok(()),
+            Some(false) => Err(AppError::conflict(format!("{path} exists and is not a folder"))),
             None => match self {
                 Endpoint::Local => tokio::fs::create_dir_all(path).await.map_err(io_err),
                 Endpoint::Remote(s) => Ok(s.sftp.create_dir(path).await?),
@@ -615,6 +666,7 @@ async fn scan(
 ) -> Result<Vec<Item>, AppError> {
     let windows = cfg!(windows);
     let mut items: Vec<Item> = Vec::new();
+    let mut seen = DestFiles::new(dst_local && (windows || cfg!(target_os = "macos")));
     for root in roots {
         let root_name = match rename {
             Some(r) if roots.len() == 1 => {
@@ -640,6 +692,10 @@ async fn scan(
         }
         let (is_dir, size, mtime, mode) = src.stat_follow(root).await?;
         if !is_dir {
+            if !seen.claim(&root_name) {
+                progress.skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             progress.files_total.fetch_add(1, Ordering::Relaxed);
             progress.bytes_total.fetch_add(size, Ordering::Relaxed);
             items.push(Item { rel: root_name, src: root.clone(), dir: false, size, mtime, mode });
@@ -680,6 +736,10 @@ async fn scan(
                         stack.push((child_src, child_rel, depth + 1));
                     }
                     _ => {
+                        if !seen.claim(&child_rel) {
+                            progress.skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         progress.files_total.fetch_add(1, Ordering::Relaxed);
                         progress.bytes_total.fetch_add(c.size, Ordering::Relaxed);
                         items.push(Item { rel: child_rel, src: child_src, dir: false, size: c.size, mtime: c.mtime, mode: c.mode });
@@ -903,11 +963,7 @@ async fn run_job(
 
     // 1. the destination must be an existing folder, 2. scan the sources
     let scanned = async {
-        match dst.stat(&spec.dest).await? {
-            Some(s) if s.is_dir => {}
-            Some(_) => return Err(AppError::conflict(format!("{} is not a folder", spec.dest))),
-            None => return Err(AppError::not_found(format!("destination {} does not exist", spec.dest))),
-        }
+        dst.check_dest(&spec.dest).await?;
         scan(&src, &spec.items, spec.rename.as_deref(), dst.is_local(), &progress).await
     };
     let items = tokio::select! {
@@ -1182,6 +1238,86 @@ mod tests {
         for ok in ["COM", "COM0", "console", "nullable.txt", "lpt10"] {
             assert!(is_safe_local_name(ok, true), "{ok}");
         }
+    }
+
+    /// Makes `link` point at the folder `target` (a junction on Windows, which
+    /// needs no admin rights). `false` when the platform refuses.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_behind_a_link_is_a_valid_destination() {
+        let base = std::env::temp_dir().join(format!("overssh-xfer-{}", uuid::Uuid::new_v4()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        if !link_dir(&real, &link) {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let link_s = link.to_string_lossy().into_owned();
+        // lstat sees a link, not a folder: this is what used to fail the job.
+        assert!(!Endpoint::Local.stat(&link_s).await.unwrap().unwrap().is_dir);
+        Endpoint::Local.check_dest(&link_s).await.unwrap();
+        Endpoint::Local.mkdir(&link_s).await.unwrap();
+        let file = real.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let file_s = file.to_string_lossy().into_owned();
+        assert!(matches!(Endpoint::Local.check_dest(&file_s).await, Err(AppError::Conflict { .. })));
+        assert!(matches!(Endpoint::Local.mkdir(&file_s).await, Err(AppError::Conflict { .. })));
+        let missing = base.join("missing").to_string_lossy().into_owned();
+        assert!(matches!(Endpoint::Local.check_dest(&missing).await, Err(AppError::NotFound { .. })));
+        Endpoint::Local.mkdir(&missing).await.unwrap();
+        assert!(Path::new(&missing).is_dir());
+        // Remove the junction itself before the tree (never follow it).
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn one_destination_file_per_job() {
+        let mut ci = DestFiles::new(true);
+        assert!(ci.claim("proj/README"));
+        assert!(!ci.claim("proj/readme"));
+        assert!(!ci.claim("proj/README"));
+        assert!(ci.claim("proj/README.md"));
+        let mut cs = DestFiles::new(false);
+        assert!(cs.claim("x/README"));
+        assert!(cs.claim("x/readme"));
+        assert!(!cs.claim("x/README")); // two picked items of the same name
+    }
+
+    #[tokio::test]
+    async fn scan_skips_a_second_source_for_the_same_file() {
+        let base = std::env::temp_dir().join(format!("overssh-scan-{}", uuid::Uuid::new_v4()));
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+            std::fs::write(base.join(d).join("same.txt"), d).unwrap();
+        }
+        let roots: Vec<String> =
+            ["a", "b"].iter().map(|d| base.join(d).join("same.txt").to_string_lossy().into_owned()).collect();
+        let progress = Progress::default();
+        let items = scan(&Endpoint::Local, &roots, None, false, &progress).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(progress.files_total.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.skipped.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
