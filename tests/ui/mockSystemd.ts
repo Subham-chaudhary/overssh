@@ -24,6 +24,8 @@ export interface SystemdFake {
   big: boolean;
   /** Makes systemd_list reject with this message. */
   listError: string | null;
+  /** systemd_list answers after this many ms (0 = at once): a refresh still in flight when the view changes. */
+  listDelayMs: number;
   units: FUnit[];
   files: FFile[];
   calls: { cmd: string; args: Record<string, unknown> }[];
@@ -63,6 +65,7 @@ export const fake: SystemdFake = {
   sudo: "ok",
   big: false,
   listError: null,
+  listDelayMs: 0,
   ...seed(),
   calls: [],
   actions: [],
@@ -73,7 +76,7 @@ declare global {
     __systemd: {
       calls: () => { cmd: string; args: Record<string, unknown> }[];
       actions: () => SystemdFake["actions"];
-      set: (patch: Partial<Pick<SystemdFake, "mode" | "sudo" | "big" | "listError">>) => void;
+      set: (patch: Partial<Pick<SystemdFake, "mode" | "sudo" | "big" | "listError" | "listDelayMs">>) => void;
       reset: () => void;
       unit: (name: string) => FUnit | undefined;
     };
@@ -85,7 +88,7 @@ window.__systemd = {
   actions: () => fake.actions.map((a) => ({ ...a })),
   set: (patch) => Object.assign(fake, patch),
   reset: () => {
-    Object.assign(fake, { mode: "ok", sudo: "ok", big: false, listError: null, ...seed(), calls: [], actions: [] });
+    Object.assign(fake, { mode: "ok", sudo: "ok", big: false, listError: null, listDelayMs: 0, ...seed(), calls: [], actions: [] });
   },
   unit: (name) => fake.units.find((x) => x.unit === name),
 };
@@ -120,6 +123,10 @@ export function systemdCommand(cmd: string, args: Record<string, unknown>): unkn
 
     case "systemd_list":
       if (fake.listError) throw { kind: "Other", message: fake.listError };
+      if (fake.listDelayMs > 0) {
+        const reply = { units: allUnits(user), unitFiles: user ? [] : fake.files, json: true };
+        return new Promise((resolve) => setTimeout(() => resolve(reply), fake.listDelayMs));
+      }
       return { units: allUnits(user), unitFiles: user ? [] : fake.files, json: true };
 
     case "systemd_failed":

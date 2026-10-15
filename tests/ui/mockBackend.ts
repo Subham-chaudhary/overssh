@@ -29,6 +29,9 @@ import { dockerFake, dockerRun, eventsStart as dockerEventsStart, logsStart as d
 import { g1GitDirList, g1GitRun, g1Patch, g1Snapshot, gitCalls as g1GitCalls, setGitMissing as g1SetGitMissing } from "./mockGit";
 // G2's handler answers only while `gitFake.active`; G1's (tests/ui/mockGit.ts) is the Source Control fake.
 const gitHandlers: GitHandler[] = [gitHandlerG2, (req) => g1GitRun(req.repo, req.args, req.stdin ?? undefined)];
+const gitSessionCalls: { sessionId: string; repo: string; args: string[] }[] = [];
+let gitHeld: string | null = null;
+const gitReleases: Array<() => void> = [];
 
 // --- fake data -------------------------------------------------------------
 
@@ -125,6 +128,8 @@ function delay(ms: number): Promise<void> {
  * `window.__harness.setReadFileDelay(ms)` (default matches the task's "1.5s
  * delay" so the loader scenario has something to observe). */
 let readFileDelayMs = 1500;
+/** Delay of write_file (window.__harness.setWriteFileDelay): edits typed during a save. */
+let writeFileDelayMs = 0;
 
 // --- fake filesystem helpers (rename / remove / copy_path) -------------------
 
@@ -440,6 +445,7 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
 
     case "write_file": {
       const path = args.path as string;
+      if (writeFileDelayMs > 0) await new Promise((r) => setTimeout(r, writeFileDelayMs));
       const expected = args.expectedMtime as number | undefined;
       if (touchedPaths.has(path) && expected !== undefined && expected !== mtimeOf(path)) {
         conflict(`${path} changed on the server`);
@@ -748,6 +754,8 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
     // §14 git: `gitHandlers` (see the end of this file) are tried in order; first non-null answer wins.
     case "git_run": {
       const req = { repo: args.repo as string, args: args.args as string[], stdin: (args.stdin as string | null) ?? null };
+      gitSessionCalls.push({ sessionId: args.sessionId as string, repo: req.repo, args: [...req.args] });
+      if (gitHeld === req.args[0]) await new Promise<void>((res) => gitReleases.push(res));
       for (const h of gitHandlers) {
         const out = h(req);
         if (out) return out;
@@ -785,6 +793,9 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
       if (cmd.startsWith("plugin:dialog|")) return dialogResult; // null = open/save cancelled
       // Window chrome (§15.3.T): minimize / maximize / close / title are only recorded.
       if (cmd.startsWith("plugin:window|")) return windowCommand(cmd.slice("plugin:window|".length), args);
+      // Close guard (closeguard.rs): recorded like the window calls they cause.
+      if (cmd === "confirm_close") return windowCommand("close", {});
+      if (cmd === "app_quit" || cmd === "quit_cancelled") return windowCommand(cmd, {});
       if (cmd === "plugin:app|version") return "0.1.0";
       // Clipboard plugin: route to the page clipboard so scenarios can read it back.
       if (cmd === "plugin:clipboard-manager|read_text") return navigator.clipboard.readText();
@@ -835,6 +846,7 @@ declare global {
       getStore: (name: string) => unknown;
       setStore: (name: string, value: unknown) => void;
       setReadFileDelay: (ms: number) => void;
+      setWriteFileDelay: (ms: number) => void;
       sessions: () => SessionInfo[];
       /** Every `connect` request the app sent, in order (secrets included, test-only). */
       connectRequests: () => ConnectRequest[];
@@ -883,6 +895,10 @@ declare global {
       g1GitSnapshot: (root?: string) => Record<string, unknown> | null;
       g1GitMissing: (missing: boolean) => void;
       g1GitPatch: (root: string, patch: Record<string, unknown>) => void;
+      /** Every `git_run` with the session id it was sent to; `gitHold("pull")` parks that git command until `gitRelease()`. */
+      gitSessionCalls: () => { sessionId: string; repo: string; args: string[] }[];
+      gitHold: (cmd: string | null) => void;
+      gitRelease: () => void;
     };
   }
 }
@@ -893,6 +909,9 @@ window.__harness = {
   setStore: (name, value) => stores.set(name, value),
   setReadFileDelay: (ms) => {
     readFileDelayMs = ms;
+  },
+  setWriteFileDelay: (ms) => {
+    writeFileDelayMs = ms;
   },
   sessions: () => [...sessions.values()],
   dropSession: (sessionId, reason = "connection reset by peer") => {
@@ -947,6 +966,14 @@ window.__harness = {
   g1GitSnapshot: (root) => g1Snapshot(root),
   g1GitMissing: (missing) => g1SetGitMissing(missing),
   g1GitPatch: (root, patch) => g1Patch(root, patch),
+  gitSessionCalls: () => gitSessionCalls.map((c) => ({ ...c, args: [...c.args] })),
+  gitHold: (cmd) => {
+    gitHeld = cmd;
+  },
+  gitRelease: () => {
+    gitHeld = null;
+    for (const res of gitReleases.splice(0)) res();
+  },
   // §15.3.D fake docker (tests/ui/mockDocker.ts)
   dockerCalls: () => dockerFake.calls.map((c) => ({ ...c, args: [...c.args] })),
   dockerFakeSet: (patch: Record<string, unknown>) => Object.assign(dockerFake, patch),

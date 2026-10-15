@@ -30,5 +30,24 @@ export const scenario: Scenario = {
     await waitFor(async () => (await dialog.count()) === 1, "confirm shown again");
     await dialog.getByRole("button", { name: "Quit anyway" }).click();
     await waitFor(async () => (await closes()) === 1, "Quit anyway closes the window");
+
+    // Alt+F4 / taskbar close: the backend's close guard asks the page (closeguard.rs).
+    await page.evaluate(() => window.__harness.emit("app://close-requested", null));
+    await waitFor(async () => (await dialog.count()) === 1, "Alt+F4 asks too");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await page.waitForTimeout(200);
+    assert((await closes()) === 1, "Cancel on Alt+F4 keeps the window");
+    await page.evaluate(() => window.__harness.emit("app://close-requested", null));
+    await waitFor(async () => (await dialog.count()) === 1, "asked again");
+    await dialog.getByRole("button", { name: "Quit anyway" }).click();
+    await waitFor(async () => (await closes()) === 2, "confirmed Alt+F4 closes");
+
+    // Tray Quit: Cancel tells the backend, so a later Quit asks again.
+    const calls = async (cmd: string) => (await page.evaluate(() => window.__harness.windowCalls())).filter((c) => c.cmd === cmd).length;
+    await page.evaluate(() => window.__harness.emit("app://quit-requested", null));
+    await waitFor(async () => (await dialog.count()) === 1, "tray Quit asks");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await waitFor(async () => (await calls("quit_cancelled")) === 1, "cancel reported");
+    assert((await calls("app_quit")) === 0, "not quit");
   },
 };
