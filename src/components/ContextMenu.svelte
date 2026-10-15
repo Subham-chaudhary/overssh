@@ -206,7 +206,10 @@
         if (!target) return;
         const norm = target.split("\\").join("/");
         const cut = norm.lastIndexOf("/");
-        const dir = cut > 0 ? target.slice(0, cut) : ".";
+        // Keep the separator for a drive or filesystem root: "C:" alone is
+        // drive-relative on Windows (it would land in that drive's cwd).
+        const head = target.slice(0, cut);
+        const dir = cut < 0 ? "." : cut === 0 || /^[A-Za-z]:$/.test(head) ? target.slice(0, cut + 1) : head;
         await startDownload(s.sessionId, paths, dir, norm.slice(cut + 1), "overwrite");
       } else {
         const dir = await open({ directory: true, multiple: false, title: "Download to folder" });
@@ -258,8 +261,9 @@
   }
 
   async function doUpload(folders: boolean): Promise<void> {
+    // Same target as "New file": inside a folder or folder-symlink row.
+    const dest = newTargetDir();
     const s = close();
-    const dest = s.entry && s.entry.kind === "dir" ? s.entry.path : s.dirPath;
     let selection: string | string[] | null;
     try {
       selection = await open(folders ? { directory: true, multiple: true } : { multiple: true });

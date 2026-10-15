@@ -2,8 +2,8 @@
   import { onMount, onDestroy } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { app } from "./lib/stores.svelte";
-  import { modKey } from "./lib/platform";
-  import { isAppError, onSessionClosed } from "./lib/api";
+  import { isMac, modKey } from "./lib/platform";
+  import { appQuit, confirmClose, isAppError, onCloseRequested, onSessionClosed, quitCancelled } from "./lib/api";
   import { settings, DEFAULTS, appliedTheme } from "./lib/settings.svelte";
   import { refreshMonacoThemes } from "./lib/monaco";
   import { openThemePicker, themePicker } from "./lib/themepicker.svelte";
@@ -114,6 +114,21 @@
         unlisten = fn;
       })
       .catch((err) => console.error("session://closed listener failed", err));
+
+    // Alt+F4, taskbar close and tray Quit ask about unsaved files too (closeguard.rs).
+    let asking = false;
+    void onCloseRequested(async (quit) => {
+      if (asking) return; // repeated Alt+F4 while the dialog is open
+      asking = true;
+      try {
+        if (await app.confirmQuit()) await (quit ? appQuit() : confirmClose());
+        else if (quit) await quitCancelled();
+      } catch (err) {
+        console.error("close failed", err);
+      } finally {
+        asking = false;
+      }
+    }).catch((err) => console.error("close listener failed", err));
 
     // Core command-palette entries. src/lib/commands.svelte.ts's registry lets
     // other modules (editor, terminal) add more later without touching this file.
@@ -597,7 +612,9 @@
       showDocker();
       return;
     }
-    if (mod && key === "tab") {
+    // macOS: Cmd+Tab never reaches the app (the OS app switcher), so Ctrl+Tab is the
+    // switcher there too, as in VS Code; releasing Control commits.
+    if ((mod || (isMac && e.ctrlKey)) && key === "tab") {
       e.preventDefault();
       e.stopPropagation(); // Monaco must not see it
       tabSwitcher.step(e.shiftKey ? -1 : 1, isInsideXterm(e.target) ? "terminal" : "file");

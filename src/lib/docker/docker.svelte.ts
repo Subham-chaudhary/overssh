@@ -245,7 +245,7 @@ class DockerStore {
   private streams: Record<string, { events?: string; stats?: string }> = {};
   private starting: Record<string, { events?: boolean; stats?: boolean }> = {};
   private dirty: Record<string, Set<EventKind | "all">> = {};
-  private dirtyTimer: ReturnType<typeof setTimeout> | undefined;
+  private dirtyTimers: Record<string, ReturnType<typeof setTimeout>> = {};
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private inited = false;
   private lastStatPush: Record<string, number> = {};
@@ -379,6 +379,8 @@ class DockerStore {
       stopSaves();
       clearInterval(this.pollTimer);
       clearTimeout(this.idleTimer);
+      for (const t of Object.values(this.dirtyTimers)) clearTimeout(t);
+      this.dirtyTimers = {};
       this.inited = false;
       for (const p of offs) void p.then((f) => f());
     };
@@ -387,6 +389,9 @@ class DockerStore {
   private forget(sid: string): void {
     delete this.streams[sid];
     delete this.refreshQueued[sid];
+    clearTimeout(this.dirtyTimers[sid]);
+    delete this.dirtyTimers[sid];
+    delete this.dirty[sid];
     for (const k of Object.keys(this.streamFailures)) if (k.startsWith(`${sid}|`)) delete this.streamFailures[k];
     delete this.data[sid];
     delete this.stats[sid];
@@ -501,16 +506,15 @@ class DockerStore {
    * meanwhile join the pending run instead of each starting one. */
   private markDirty(sid: string, kind: EventKind | "all"): void {
     (this.dirty[sid] ??= new Set()).add(kind);
-    if (this.dirtyTimer !== undefined) return;
+    if (this.dirtyTimers[sid] !== undefined) return;
     const wait = Math.max(350, (this.lastRefreshEnd[sid] ?? 0) + this.refreshGap(sid) - Date.now());
-    this.dirtyTimer = setTimeout(() => {
-      this.dirtyTimer = undefined;
-      for (const [id, set] of Object.entries(this.dirty)) {
-        delete this.dirty[id];
-        if (this.data[id]?.phase !== "ready") continue;
-        void this.refresh(id, set.has("all") ? undefined : ([...set] as EventKind[]));
-      }
-    }, 350);
+    this.dirtyTimers[sid] = setTimeout(() => {
+      delete this.dirtyTimers[sid];
+      const set = this.dirty[sid];
+      delete this.dirty[sid];
+      if (!set || this.data[sid]?.phase !== "ready") return;
+      void this.refresh(sid, set.has("all") ? undefined : ([...set] as EventKind[]));
+    }, wait);
   }
 
   // --- running docker ---------------------------------------------------------------
@@ -858,7 +862,8 @@ class DockerStore {
     const sid = this.sessionId;
     const s = app.sessions.find((x) => x.id === sid);
     if (!sid || !s) return;
-    let targetHost = "127.0.0.1";
+    // A port published on one address (`-p 10.0.0.5:8080:80`) does not answer on 127.0.0.1.
+    let targetHost = p.hostIp && p.hostIp !== "0.0.0.0" && p.hostIp !== "::" ? p.hostIp : "127.0.0.1";
     let targetPort = p.hostPort ?? p.containerPort;
     if (!p.hostPort) {
       // Not published: reach the container IP directly.

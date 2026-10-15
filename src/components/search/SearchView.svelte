@@ -62,7 +62,8 @@
   const hl = $derived(highlightRegex());
 
   function onKey(e: KeyboardEvent): void {
-    if (e.key === "Enter") {
+    // Enter that confirms an IME composition (Japanese, Chinese, Korean) is not a search request.
+    if (e.key === "Enter" && !e.isComposing) {
       e.preventDefault();
       void runSearch();
     }

@@ -37,14 +37,17 @@
     if (!sessionId || !ids.includes(sessionId)) sessionId = app.activeSessionId ?? ids[0] ?? null;
   });
 
+  let discoverSeq = 0;
   async function discover(id: string) {
+    const mine = ++discoverSeq;
     discovering = true;
     try {
-      discovery = await api.logsDiscover(id);
+      const d = await api.logsDiscover(id);
+      if (mine === discoverSeq) discovery = d; // the picked session changed meanwhile: not this one's list
     } catch {
-      discovery = null;
+      if (mine === discoverSeq) discovery = null;
     } finally {
-      discovering = false;
+      if (mine === discoverSeq) discovering = false;
     }
   }
 
@@ -52,6 +55,10 @@
     const id = sessionId;
     discovery = null;
     if (id) untrack(() => void discover(id));
+    else {
+      discoverSeq++; // no session: drop an answer still on its way
+      discovering = false;
+    }
   });
 
   // Palette "Open Log File…" focuses the path box.

@@ -10,6 +10,7 @@ import type { Snippet } from "../../lib/types";
 import {
   extractVariables,
   formatDate,
+  isSecretName,
   parseTemplate,
   renderTemplate,
   usedBuiltins,
@@ -106,9 +107,12 @@ export async function execute(
   mode: RunMode,
   values: Record<string, string>,
 ): Promise<boolean> {
+  // A secret typed into a variable must not end up in the snippet store or the command history.
+  const secret = Object.keys(values).some(isSecretName);
+  const remembered = Object.fromEntries(Object.entries(values).filter(([k]) => !isSecretName(k)));
   if (mode === "copy") {
     await copyText(command);
-    if (snippet) markSnippetUsed(snippet.id, values);
+    if (snippet) markSnippetUsed(snippet.id, remembered);
     return true;
   }
   const sessionId = app.activeSessionId;
@@ -121,18 +125,18 @@ export async function execute(
     if (mode === "new") {
       const cwd = app.workspaces[sessionId]?.explorer.cwd;
       await terminalStore.openNew(sessionId, { command, title: command.split("\n")[0], cwd });
-      record(host, command);
+      if (!secret) record(host, command);
     } else {
       const id = await ensureTargetTerminal();
       if (!id) return false;
       if (mode === "run") {
         await api.termWrite(id, command + "\r");
-        record(host, command);
+        if (!secret) record(host, command);
       } else {
         await api.termWrite(id, command);
       }
     }
-    if (snippet) markSnippetUsed(snippet.id, values);
+    if (snippet) markSnippetUsed(snippet.id, remembered);
     return true;
   } catch (err) {
     app.addToast("error", isAppError(err) ? err.message : String(err));

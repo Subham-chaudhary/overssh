@@ -13,6 +13,7 @@
   let diff: Monaco.editor.IStandaloneDiffEditor | undefined;
   let original: Monaco.editor.ITextModel | undefined;
   let modified: Monaco.editor.ITextModel | undefined;
+  let saveAction: Monaco.IDisposable | undefined;
   let sideBySide = $state(true);
   let busy = $derived(tab.saving);
 
@@ -43,7 +44,14 @@
         minimap: { enabled: false },
       });
       diff.setModel({ original, modified });
-      diff.getModifiedEditor().addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, save);
+      // addAction (editor-scoped, disposable), not addCommand (global, never
+      // removed: it kept Ctrl+S bound to this disposed view after it closed).
+      saveAction = diff.getModifiedEditor().addAction({
+        id: "overssh.saveMerged",
+        label: "Save merged",
+        keybindings: [m.KeyMod.CtrlCmd | m.KeyCode.KeyS],
+        run: save,
+      });
       diff.getModifiedEditor().focus();
     });
     return () => {
@@ -52,6 +60,7 @@
   });
 
   onDestroy(() => {
+    saveAction?.dispose();
     diff?.setModel(null);
     diff?.dispose();
     original?.dispose();

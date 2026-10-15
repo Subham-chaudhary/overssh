@@ -243,11 +243,16 @@ function listText(items: string[]): string {
   return items.slice(0, -1).join(", ") + " and " + items[items.length - 1];
 }
 
-/** Step of a "star slash n" field when the values form a sequence starting at `min`. */
-function stepOf(f: ParsedField, min: number): number | null {
+/**
+ * Step of a "star slash n" field when the values form a sequence starting at `min`.
+ * With `span` (the size of the range: 60 minutes, 24 hours, 12 months) the step must divide it:
+ * "star slash 45" in the minute field runs at :00 and :45 of every hour, not every 45 minutes.
+ */
+function stepOf(f: ParsedField, min: number, span?: number): number | null {
   const m = /^(\*|\d+-\d+|\d+)\/(\d+)$/.exec(f.raw);
   if (!m || m[1] !== "*") return null;
   const step = Number(m[2]);
+  if (span !== undefined && span % step !== 0) return null;
   return f.values[0] === min ? step : null;
 }
 
@@ -287,7 +292,7 @@ function dowText(f: ParsedField): string {
 function monthText(f: ParsedField): string {
   const v = f.values;
   if (v.length === 12) return "";
-  const step = stepOf({ ...f, values: v.map((x) => x - 1) }, 0);
+  const step = stepOf({ ...f, values: v.map((x) => x - 1) }, 0, 12);
   if (step && /\*\/\d+/.test(f.raw)) return `every ${step === 1 ? "" : ordinal(step) + " "}month`.replace("  ", " ");
   return "in " + v.map((m) => MONTH_NAMES[m - 1]).join(", ");
 }
@@ -305,14 +310,15 @@ function timeText(p: ParsedSchedule): string {
   const h = p.hour;
   const mStar = m.values.length === 60;
   const hStar = h.values.length === 24;
-  const mStep = stepOf(m, 0);
-  const hStep = stepOf(h, 0);
+  const mStep = stepOf(m, 0, 60);
+  const hStep = stepOf(h, 0, 24);
 
   if (mStar && hStar) return "every minute";
   if (mStep && hStar) return `every ${plural(mStep, "minute")}`;
   if (!mStar && m.values.length === 1 && hStar) {
     return m.values[0] === 0 ? "every hour" : `every hour at minute ${m.values[0]}`;
   }
+  if (!mStar && !mStep && hStar) return `every hour at minutes ${m.values.join(", ")}`;
   if (!mStar && !hStar && !hStep && m.values.length * h.values.length <= 4) {
     const times: string[] = [];
     for (const hh of h.values) for (const mm of m.values) times.push(`${pad2(hh)}:${pad2(mm)}`);

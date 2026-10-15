@@ -290,7 +290,11 @@ if (typeof window !== "undefined") {
     const jumped = isClockJump(lastTick, now, 1000);
     lastTick = now;
     if (Object.keys(reconnect.items).length > 0) reconnectClock.now = now;
-    if (jumped) void probeSessions();
+    // A hidden (tray / minimized) page has its timers throttled to about once a
+    // minute, which looks like a jump on every tick: that would ping every session
+    // each minute while hidden (§17). The visibilitychange handler below probes
+    // once when the window comes back after more than SLEEP_JUMP_MS.
+    if (jumped && !document.hidden) void probeSessions();
   }, 1000);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {

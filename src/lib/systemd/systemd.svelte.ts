@@ -89,6 +89,8 @@ class SystemdStore {
 
   private viewMounts = 0;
   private viewSession: string | null = null;
+  private viewGen = 0;
+  private badgeGen = 0;
   private listTimer: ReturnType<typeof setTimeout> | null = null;
   private badgeTimer: ReturnType<typeof setTimeout> | null = null;
   private badgeSession: string | null = null;
@@ -133,6 +135,17 @@ class SystemdStore {
       .finally(() => this.probing.delete(sid));
     this.probing.set(sid, p);
     return p;
+  }
+
+  /** The session is gone (closed, or replaced by a reconnect): drop everything cached for it. */
+  forget(sid: string): void {
+    delete this.probes[sid];
+    delete this.probeErrors[sid];
+    delete this.failed[sid];
+    const prefix = `${sid}|`;
+    for (const k of Object.keys(this.lists)) if (k.startsWith(prefix)) delete this.lists[k];
+    for (const k of Object.keys(this.timers)) if (k.startsWith(prefix)) delete this.timers[k];
+    for (const k of [...this.cpuPrev.keys()]) if (k.startsWith(prefix)) this.cpuPrev.delete(k);
   }
 
   list(sid: string, user = this.prefs.user): ListData | undefined {
@@ -216,11 +229,15 @@ class SystemdStore {
   attachView(sid: string): () => void {
     this.viewMounts++;
     this.viewSession = sid;
+    // One polling chain per attach: a tick still awaiting its refresh when the view is left and
+    // re-entered must not re-arm the timer next to the new chain (two chains would poll twice).
+    const gen = ++this.viewGen;
     let failures = 0;
     const tick = async () => {
       this.listTimer = null;
-      if (this.viewSession !== sid) return;
+      if (this.viewSession !== sid || this.viewGen !== gen) return;
       if (!document.hidden) await this.refresh(sid);
+      if (this.viewGen !== gen) return;
       const l = this.list(sid);
       if (l?.gone) return; // session closed: stop polling (a reconnect remounts the view)
       // Back off while the host keeps failing (slow or broken systemctl), up to 1 min.
@@ -231,6 +248,7 @@ class SystemdStore {
     void tick();
     return () => {
       this.viewMounts--;
+      if (this.viewGen === gen) this.viewGen++; // retires this chain's pending tick
       if (this.viewSession === sid) {
         this.viewSession = null;
         if (this.listTimer) clearTimeout(this.listTimer);
@@ -242,24 +260,29 @@ class SystemdStore {
   /** MonitorView mounted: keep the failed count of the selected session fresh. */
   watchBadge(sid: string | null): () => void {
     this.badgeSession = sid;
+    const gen = ++this.badgeGen; // a tick of an older chain (same sid, still awaiting) must not re-arm
     if (this.badgeTimer) clearTimeout(this.badgeTimer);
     this.badgeTimer = null;
     if (!sid) return () => {};
     const tick = async () => {
       this.badgeTimer = null;
-      if (this.badgeSession !== sid) return;
+      if (this.badgeSession !== sid || this.badgeGen !== gen) return;
       const probe = await this.probe(sid);
+      if (this.badgeGen !== gen) return;
       if (probe?.available && !document.hidden && this.viewSession !== sid) {
         try {
-          this.failed[sid] = await api.systemdFailed(sid, false);
+          const failed = await api.systemdFailed(sid, false);
+          if (this.badgeGen !== gen) return;
+          this.failed[sid] = failed;
         } catch (e) {
           if (isGone(e)) return;
         }
       }
-      if (this.badgeSession === sid) this.badgeTimer = setTimeout(tick, BADGE_MS);
+      if (this.badgeGen === gen && this.badgeSession === sid) this.badgeTimer = setTimeout(tick, BADGE_MS);
     };
     void tick();
     return () => {
+      if (this.badgeGen === gen) this.badgeGen++;
       if (this.badgeSession === sid) {
         this.badgeSession = null;
         if (this.badgeTimer) clearTimeout(this.badgeTimer);
@@ -364,6 +387,8 @@ function past(action: SystemdAction): string {
 }
 
 export const systemd = new SystemdStore();
+app.onSessionLost((id) => systemd.forget(id));
+app.onSessionRemap((oldId) => systemd.forget(oldId));
 
 registerCommand({
   id: "monitor.services",

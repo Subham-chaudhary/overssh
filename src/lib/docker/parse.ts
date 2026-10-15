@@ -385,12 +385,15 @@ export function parseImages(text: string): DockerImage[] {
       if (first && first !== "<none>:<none>") ({ repo, tag } = splitRef(first));
     }
     const dangling = !repo || repo === "<none>";
+    // Pulled by digest (`image: nginx@sha256:...`): the tag column is "<none>", and `repo:<none>` is
+    // not a reference any docker command accepts. Use the short id for the commands.
+    const untagged = !dangling && tag === "<none>";
     const sizeRaw = pick(o, "Size", "VirtualSize", "size");
     out.push({
       id: id.slice(0, 12),
       repository: dangling ? "<none>" : repo,
       tag: dangling ? "<none>" : tag || "latest",
-      ref: dangling ? id.slice(0, 12) : `${repo}:${tag || "latest"}`,
+      ref: dangling || untagged ? id.slice(0, 12) : `${repo}:${tag || "latest"}`,
       dangling,
       size: parseSize(sizeRaw),
       sizeText: typeof sizeRaw === "string" ? sizeRaw : formatBytes(parseSize(sizeRaw)),

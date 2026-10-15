@@ -78,6 +78,8 @@ export interface DetachHooks {
   reopen(): void;
   activate(id: string): void;
   remap(oldId: string, newId: string): void;
+  /** The session is gone for good (disconnect, reconnect cancelled). */
+  lost(sessionId: string): void;
   focusWindow(): void;
   /** Splits the detached window's terminal area (§15.3.S). */
   split(dir: "row" | "col"): void;
@@ -503,6 +505,10 @@ class TerminalStore {
         } catch (err) {
           this.dataHandlers.get(oldId)?.("\r\n\x1b[31m— could not reopen the shell —\x1b[0m\r\n");
           console.error("terminal rebind failed", err);
+          // The old session id is gone after the remap: follow the new one so the tab
+          // keeps its label and is closed with that session (`sessionLost`).
+          tab.sessionId = newSessionId;
+          tab.exited = true;
           continue;
         }
         const size = lastTermSize.get(oldId);
@@ -531,6 +537,20 @@ class TerminalStore {
       this.rebinding--;
       if (this.rebinding === 0) this.orphans.clear();
     }
+  }
+
+  /** A session is gone for good (user disconnect, or a cancelled auto-reconnect):
+   * its PTYs are gone too. Tabs kept as "connection lost" during the reconnect will
+   * never get another term://exit, so they are dropped here. */
+  sessionLost(sessionId: string): void {
+    if (this.detached) {
+      this.hooks?.lost(sessionId); // the terminal window owns the tabs
+      return;
+    }
+    const gone = this.tabs.filter((t) => t.sessionId === sessionId).map((t) => t.id);
+    if (gone.length === 0) return;
+    for (const id of gone) this.forget(id);
+    if (this.tabs.length === 0) app.showTerminal = false;
   }
 
   /** Handles one term://exit: per docs/GUIDE.md §12 item 2, a terminal closes
@@ -656,3 +676,4 @@ class TerminalStore {
 export const terminalStore = new TerminalStore();
 
 app.onSessionRemap((oldId, newId) => terminalStore.rebindSession(oldId, newId));
+app.onSessionLost((id) => terminalStore.sessionLost(id));

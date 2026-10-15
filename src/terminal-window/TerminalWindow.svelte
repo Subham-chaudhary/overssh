@@ -4,7 +4,7 @@
   // (Ctrl+W/T/Shift+T, Ctrl+Tab switcher over the terminals) and Toaster.
   import { onMount, untrack } from "svelte";
   import { app } from "../lib/stores.svelte";
-  import { modKey } from "../lib/platform";
+  import { isMac, modKey } from "../lib/platform";
   import { settings } from "../lib/settings.svelte";
   import { THEMES } from "../lib/themes";
   import { isAppError } from "../lib/api";
@@ -104,7 +104,8 @@
       else void newTerminal();
       return;
     }
-    if (mod && key === "tab") {
+    // macOS: Cmd+Tab is the OS app switcher, so Ctrl+Tab switches terminals there too.
+    if ((mod || (isMac && e.ctrlKey)) && key === "tab") {
       e.preventDefault();
       e.stopPropagation();
       tabSwitcher.step(e.shiftKey ? -1 : 1, "terminal");

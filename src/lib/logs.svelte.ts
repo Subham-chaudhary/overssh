@@ -18,6 +18,9 @@ import { registerCommand } from "./commands.svelte";
 import { basename } from "./paths";
 import type { LogSourceSpec } from "./types";
 
+/** Upper bound for the text held by one open log (~100 MB as UTF-16). */
+const MAX_CHARS = 50_000_000;
+
 export const LEVELS = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "OTHER"] as const;
 export const LEVEL_CLASS = ["error", "warn", "info", "debug", "trace", "other"] as const;
 
@@ -113,6 +116,8 @@ export class LogTab {
   levels: number[] = [];
   dropped = 0;
   maxLen = 0;
+  /** Characters held in `lines` (the line count alone does not bound memory: a line can be 256 KB). */
+  private chars = 0;
   rev = $state(0);
   total = $state(0); // lines currently held
   counts = $state<number[]>([0, 0, 0, 0, 0, 0]);
@@ -184,10 +189,18 @@ export class LogTab {
       this.levels.push(lv);
       this.countsRaw[lv < 0 ? 5 : lv]++;
       if (l.length > this.maxLen) this.maxLen = l.length;
+      this.chars += l.length;
     }
     const cap = Math.max(1000, logStore.prefs.maxLines);
     const excess = this.lines.length - cap;
     if (excess > 0 && excess >= Math.min(1000, cap / 10)) this.trim(excess);
+    if (this.chars > MAX_CHARS) {
+      // A binary file or minified JSON without newlines: 100k lines of 256 KB would be 25 GB.
+      let n = 0;
+      let c = this.chars;
+      while (n < this.lines.length - 1 && c > MAX_CHARS * 0.8) c -= this.lines[n++].length;
+      if (n > 0) this.trim(n);
+    }
     this.total = this.lines.length;
     this.counts = [...this.countsRaw];
     this.rev++;
@@ -197,6 +210,7 @@ export class LogTab {
     for (let i = 0; i < n; i++) {
       const lv = this.levels[i];
       this.countsRaw[lv < 0 ? 5 : lv]--;
+      this.chars -= this.lines[i].length;
     }
     this.lines.splice(0, n);
     this.levels.splice(0, n);
@@ -224,12 +238,16 @@ export class LogTab {
   }
 
   clear(): void {
+    // Lines held back by Pause belong to what is being cleared (or to the stream being restarted).
+    this.pauseBuf = [];
+    this.pausedBuffered = 0;
     this.dropped += this.lines.length;
     this.lines = [];
     this.levels = [];
     this.countsRaw = [0, 0, 0, 0, 0, 0];
     this.counts = [0, 0, 0, 0, 0, 0];
     this.maxLen = 0;
+    this.chars = 0;
     this.visible = [];
     this.ctxOnly = new Set();
     this.processed = this.dropped;
@@ -324,6 +342,9 @@ export class LogTab {
 const byStream = new Map<string, LogTab>();
 /** Events that arrive before `logs_open` has resolved with the stream id. */
 const orphans = new Map<string, string[][]>();
+/** `logs://end` that arrives before `logs_open` has resolved (a short command): applied by adopt(). */
+const earlyEnds = new Map<string, { code: number | null; error: string | null | undefined }>();
+const EARLY_END_TTL_MS = 15_000;
 /** Latest openLog() per tab id: an older open that resolves later is closed, not adopted. */
 const openSeq = new Map<string, number>();
 
@@ -335,6 +356,15 @@ function adopt(tab: LogTab, streamId: string): void {
   if (early) {
     orphans.delete(streamId);
     for (const lines of early) tab.ingest(lines);
+  }
+  const end = earlyEnds.get(streamId);
+  if (end) {
+    earlyEnds.delete(streamId);
+    byStream.delete(streamId);
+    tab.streamId = null;
+    tab.endCode = end.code;
+    if (end.error) tab.error = end.error;
+    tab.status = "ended";
   }
 }
 
@@ -419,6 +449,7 @@ export async function openLog(sessionId: string, spec: LogSourceSpec, existing?:
     // Tab closed, or restarted again, while the stream was opening: do not leave it running unseen.
     if (openSeq.get(tab.id) !== seq || !logStore.tabs.some((t) => t.id === tab.id)) {
       orphans.delete(id);
+      earlyEnds.delete(id);
       void api.logsClose(id).catch(() => {});
       return tab;
     }
@@ -523,8 +554,20 @@ void api.onLogData(({ streamId, lines }) => {
 
 void api.onLogEnd(({ streamId, code, error }) => {
   const tab = byStream.get(streamId);
+  if (!tab) {
+    // Not adopted yet: logs_open is still resolving. Keep its lines and the end, so the tab shows
+    // them and does not claim "live" forever. The end of a stream we closed ourselves also lands
+    // here: both entries expire.
+    if (earlyEnds.size < 200) {
+      earlyEnds.set(streamId, { code, error });
+      setTimeout(() => {
+        earlyEnds.delete(streamId);
+        orphans.delete(streamId);
+      }, EARLY_END_TTL_MS);
+    } else orphans.delete(streamId);
+    return;
+  }
   orphans.delete(streamId);
-  if (!tab) return;
   byStream.delete(streamId);
   tab.streamId = null;
   tab.endCode = code;

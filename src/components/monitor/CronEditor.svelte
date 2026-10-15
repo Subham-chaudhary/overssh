@@ -311,6 +311,8 @@
           <p class="mt-1.5 font-medium" data-testid="cron-live-desc">{fDesc}</p>
           {#if fNext.length}
             <p class="text-[11px] text-muted-foreground" data-testid="cron-live-next">Next: {fNext.map((d) => formatRun(d, now)).join(" · ")}</p>
+          {:else if !check.parsed.reboot}
+            <p class="text-[11px] text-warning" data-testid="cron-live-never">This schedule never runs (for example Feb 30 or Apr 31).</p>
           {/if}
         {:else}
           <p class="mt-1.5 text-destructive" data-testid="cron-live-error">{check.error}</p>

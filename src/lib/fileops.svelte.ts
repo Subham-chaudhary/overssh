@@ -208,8 +208,9 @@ async function handleDeleted(sessionId: string, path: string): Promise<void> {
 
 interface FileOp {
   label: string;
-  undo(): Promise<void>;
-  redo(): Promise<void>;
+  /** `sid` is the session's current id (it changes on auto-reconnect). */
+  undo(sid: string): Promise<void>;
+  redo(sid: string): Promise<void>;
 }
 
 const MAX_UNDO = 50;
@@ -248,7 +249,7 @@ export async function undoFileOp(sessionId: string): Promise<void> {
   stackVersion++;
   if (!op) return;
   try {
-    await op.undo();
+    await op.undo(sessionId);
     s.redo.push(op);
     app.addToast("info", `Undid: ${op.label}`);
   } catch (err) {
@@ -263,7 +264,7 @@ export async function redoFileOp(sessionId: string): Promise<void> {
   stackVersion++;
   if (!op) return;
   try {
-    await op.redo();
+    await op.redo(sessionId);
     s.undo.push(op);
     app.addToast("info", `Redid: ${op.label}`);
   } catch (err) {
@@ -271,6 +272,21 @@ export async function redoFileOp(sessionId: string): Promise<void> {
   }
   stackVersion++;
 }
+
+// Auto-reconnect (§13.4.A) rebinds the workspace to a new session id: carry the
+// undo history and the file clipboard over, so Paste / Ctrl+Z keep working.
+app.onSessionRemap((oldId, newId) => {
+  const s = stacks.get(oldId);
+  if (s) {
+    stacks.delete(oldId);
+    stacks.set(newId, s);
+    stackVersion++;
+  }
+  if (fileClipboard.sessionId === oldId) fileClipboard.sessionId = newId;
+});
+app.onSessionLost((id) => {
+  if (stacks.delete(id)) stackVersion++;
+});
 
 async function refreshParents(sessionId: string, ...paths: string[]): Promise<void> {
   for (const dir of new Set(paths.map(dirname))) await app.refreshDir(sessionId, dir);
@@ -348,16 +364,16 @@ app.onEntryCreated = (sessionId, path, kind) => {
   let snap: Snap | null = null;
   pushOp(sessionId, {
     label: `Create ${basename(path)}`,
-    async undo() {
-      snap = await capture(sessionId, path).catch(() => null);
-      await removePath(sessionId, path, kind === "dir");
+    async undo(sid) {
+      snap = await capture(sid, path).catch(() => null);
+      await removePath(sid, path, kind === "dir");
     },
-    async redo() {
-      if (snap) await restoreAt(sessionId, path, snap);
+    async redo(sid) {
+      if (snap) await restoreAt(sid, path, snap);
       else {
-        if (kind === "dir") await api.createDir(sessionId, path);
-        else await api.createFile(sessionId, path);
-        await refreshParents(sessionId, path);
+        if (kind === "dir") await api.createDir(sid, path);
+        else await api.createFile(sid, path);
+        await refreshParents(sid, path);
       }
     },
   });
@@ -397,8 +413,8 @@ export async function renameEntry(sessionId: string, entry: FileEntry, parentDir
   const from = entry.path;
   pushOp(sessionId, {
     label: `Rename ${current} to ${name}`,
-    undo: () => movePath(sessionId, to, from),
-    redo: () => movePath(sessionId, from, to),
+    undo: (sid) => movePath(sid, to, from),
+    redo: (sid) => movePath(sid, from, to),
   });
 }
 
@@ -460,14 +476,14 @@ export async function deleteEntries(
     pushOp(sessionId, {
       label:
         deleted.length === 1 ? `Delete ${basename(deleted[0].path)}` : `Delete ${deleted.length} items`,
-      async undo() {
+      async undo(sid) {
         for (const d of [...deleted].reverse()) {
           if (!d.snap) throw new Error(`${basename(d.path)} was not kept for undo`);
-          await restoreAt(sessionId, d.path, d.snap);
+          await restoreAt(sid, d.path, d.snap);
         }
       },
-      async redo() {
-        for (const d of deleted) await removePath(sessionId, d.path, d.isDir);
+      async redo(sid) {
+        for (const d of deleted) await removePath(sid, d.path, d.isDir);
       },
     });
   }
@@ -574,23 +590,23 @@ export async function transferEntries(
   if (moved.length > 0) {
     pushOp(sessionId, {
       label: `Move ${what(moved.length, moved[0].from)}`,
-      async undo() {
-        for (const m of [...moved].reverse()) await movePath(sessionId, m.to, m.from);
+      async undo(sid) {
+        for (const m of [...moved].reverse()) await movePath(sid, m.to, m.from);
       },
-      async redo() {
-        for (const m of moved) await movePath(sessionId, m.from, m.to);
+      async redo(sid) {
+        for (const m of moved) await movePath(sid, m.from, m.to);
       },
     });
   }
   if (copied.length > 0) {
     pushOp(sessionId, {
       label: `Copy ${what(copied.length, copied[0].from)}`,
-      async undo() {
-        for (const c of [...copied].reverse()) await removePath(sessionId, c.to, c.isDir);
+      async undo(sid) {
+        for (const c of [...copied].reverse()) await removePath(sid, c.to, c.isDir);
       },
-      async redo() {
-        for (const c of copied) await api.copyPath(sessionId, c.from, c.to);
-        await refreshParents(sessionId, ...copied.map((c) => c.to));
+      async redo(sid) {
+        for (const c of copied) await api.copyPath(sid, c.from, c.to);
+        await refreshParents(sid, ...copied.map((c) => c.to));
       },
     });
   }

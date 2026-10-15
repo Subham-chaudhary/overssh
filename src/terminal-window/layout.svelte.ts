@@ -53,6 +53,9 @@ class TermLayout {
   width = $state(0);
   height = $state(0);
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A split is waiting for its new terminal: a second split now would split the
+   * still-empty pane and the first terminal would land in the wrong one. */
+  private splitting = false;
 
   get leafCount(): number {
     return leaves(this.root).length;
@@ -143,6 +146,7 @@ class TermLayout {
 
   /** Splits the focused pane and opens a new terminal in the new pane. */
   async split(dir: SplitDir): Promise<boolean> {
+    if (this.splitting) return false;
     if (this.leafCount >= MAX_PANES) {
       app.addToast("info", `At most ${MAX_PANES} terminal panes`);
       return false;
@@ -155,12 +159,15 @@ class TermLayout {
     const r = splitLeaf(this.root, this.focusId, dir);
     if (!r) return false;
     this.apply({ root: r.root, focusId: r.leafId });
+    this.splitting = true;
     try {
       await terminalStore.openNew(sid, { cwd: terminalStore.cwdFor(sid) });
     } catch (err) {
       app.addToast("error", isAppError(err) ? err.message : String(err));
       this.dropEmptyPanes();
       return false;
+    } finally {
+      this.splitting = false;
     }
     return true;
   }

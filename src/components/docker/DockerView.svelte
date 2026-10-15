@@ -5,9 +5,9 @@
   import { clipboardWrite } from "$lib/clipboard";
   import { onMount } from "svelte";
   import { dockerStore, type SelKind } from "$lib/docker/docker.svelte";
-  import { isRunning, formatBytes, type Container } from "$lib/docker/parse";
+  import { isRunning, formatBytes, type Container, type DockerImage } from "$lib/docker/parse";
   import { settings } from "$lib/settings.svelte";
-  import { dotClass, matches, portsSummary, LIST_CAP, TABS } from "$lib/docker/ui";
+  import { dotClass, imageLabel, matches, portsSummary, LIST_CAP, TABS } from "$lib/docker/ui";
   import DockerState from "./DockerState.svelte";
   import DockerMenu, { type MenuItem } from "./DockerMenu.svelte";
   import HelpOverlay from "./HelpOverlay.svelte";
@@ -88,10 +88,23 @@
         return dockerStore.projects
           .filter((p) => matches(filter, p.name))
           .map((p) => ({ id: p.name, label: p.name, sub: p.configFiles[0] ?? "", right: `${p.running}/${p.total}`, dot: p.running > 0 ? "bg-success" : "bg-muted-foreground/50" }));
-      case "images":
-        return d.images
-          .filter((i) => matches(filter, i.ref, i.id))
-          .map((i) => ({ id: i.id, label: i.dangling ? `<none> ${i.id}` : i.ref, sub: i.createdSince, right: i.sizeText || formatBytes(i.size), dot: i.containers > 0 ? "bg-success" : "bg-muted-foreground/40" }));
+      case "images": {
+        // `docker images` prints one row per tag: tags of one image share an ID, and the detail
+        // pane works per ID. One row per image keeps the keys unique and the arrow keys moving.
+        const byId = new Map<string, DockerImage[]>();
+        for (const i of d.images) if (matches(filter, i.ref, i.id)) (byId.get(i.id) ?? byId.set(i.id, []).get(i.id)!).push(i);
+        return [...byId.values()].map((g) => {
+          const i = g[0];
+          const more = g.slice(1).map((x) => x.ref);
+          return {
+            id: i.id,
+            label: imageLabel(i),
+            sub: more.length ? `also ${more.join(", ")}` : i.createdSince,
+            right: i.sizeText || formatBytes(i.size),
+            dot: g.some((x) => x.containers > 0) ? "bg-success" : "bg-muted-foreground/40",
+          };
+        });
+      }
       case "volumes":
         return d.volumes.filter((v) => matches(filter, v.name)).map((v) => ({ id: v.name, label: v.name, sub: v.project ?? "", right: v.driver, dot: "bg-muted-foreground/40" }));
       case "networks":

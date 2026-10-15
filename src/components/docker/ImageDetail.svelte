@@ -1,5 +1,6 @@
 <script lang="ts">
   import { dockerStore } from "$lib/docker/docker.svelte";
+  import { imageLabel } from "$lib/docker/ui";
   import { formatBytes, friendlyDockerError, parseHistory, type HistoryLayer } from "$lib/docker/parse";
   import { app } from "$lib/stores.svelte";
   import DetailTabs from "./DetailTabs.svelte";
@@ -42,7 +43,7 @@
   const maxLayer = $derived(Math.max(1, ...layers.map((l) => l.size)));
 
   async function pull(): Promise<void> {
-    if (!img || img.dangling) return;
+    if (!img || img.dangling || img.tag === "<none>") return;
     await dockerStore.act(`img:${id}`, `Pulled ${ref}`, ["pull", ref], { refresh: ["images", "containers", "df"] });
   }
 
@@ -73,7 +74,7 @@
   {:else}
     <div class="flex-none border-b border-border px-3 py-2">
       <div class="flex min-w-0 items-center gap-2">
-        <h2 class="min-w-0 truncate text-sm font-semibold" data-testid="docker-detail-title">{img.dangling ? `<none> ${img.id}` : img.ref}</h2>
+        <h2 class="min-w-0 truncate text-sm font-semibold" data-testid="docker-detail-title">{imageLabel(img)}</h2>
         {#if img.dangling}<span class="flex-none rounded bg-warning/20 px-1.5 py-0.5 text-[10px] text-warning uppercase">dangling</span>{/if}
         {#if busy}<span class="flex-none animate-pulse text-[11px] text-muted-foreground">{busy}</span>{/if}
       </div>
@@ -82,7 +83,7 @@
       </div>
       <div class="mt-2 flex flex-wrap gap-1">
         <Button size="sm" class={btn} data-testid="docker-image-run" onclick={() => (dockerStore.runImage = ref)}><PlayIcon class="size-3.5" /><span class="hidden @lg/main:inline">Run…</span></Button>
-        <Button size="sm" variant="outline" class={btn} disabled={img.dangling || !!busy} data-testid="docker-image-pull" onclick={pull}><DownloadIcon class="size-3.5" /><span class="hidden @lg/main:inline">Pull</span></Button>
+        <Button size="sm" variant="outline" class={btn} disabled={img.dangling || img.tag === "<none>" || !!busy} data-testid="docker-image-pull" onclick={pull}><DownloadIcon class="size-3.5" /><span class="hidden @lg/main:inline">Pull</span></Button>
         <Button size="sm" variant="outline" class={btn} onclick={tag}><TagIcon class="size-3.5" /><span class="hidden @lg/main:inline">Tag…</span></Button>
         <Button size="sm" variant="outline" class={`${btn} text-destructive`} disabled={!!busy} data-testid="docker-image-remove" onclick={() => remove(false)}><Trash2Icon class="size-3.5" /><span class="hidden @lg/main:inline">Remove</span></Button>
         <Button size="sm" variant="outline" class={btn} data-testid="docker-image-prune" onclick={pruneDangling}><BroomIcon class="size-3.5" /><span class="hidden @lg/main:inline">Prune dangling</span></Button>
@@ -94,7 +95,7 @@
         <div class="h-full overflow-auto p-3 text-[12px]">
           <h3 class="mb-1 text-[11px] font-semibold text-muted-foreground uppercase">Tags</h3>
           <ul class="mb-3 space-y-0.5 font-mono">
-            {#each imgs as i (i.ref)}<li>{i.dangling ? "(untagged)" : i.ref}</li>{/each}
+            {#each imgs as i (i.ref)}<li>{i.dangling ? "(untagged)" : imageLabel(i)}</li>{/each}
           </ul>
           <h3 class="mb-1 text-[11px] font-semibold text-muted-foreground uppercase">Containers using this image</h3>
           {#if users.length === 0}

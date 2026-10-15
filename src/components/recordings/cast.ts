@@ -18,11 +18,21 @@ export interface Cast {
   duration: number;
 }
 
+export const MAX_COLS = 500;
+export const MAX_ROWS = 300;
+
+/** A terminal size from a file: an integer in 1..max, else `fallback`. A hostile header must not make xterm allocate gigabytes. */
+export function clampDim(v: unknown, max: number, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 1 ? Math.min(max, Math.floor(v)) : fallback;
+}
+
 export function parseCast(text: string, idleCap = 2): Cast {
   const lines = text.split("\n");
-  let header: { width?: number; height?: number; title?: string } = {};
+  let header: { width?: unknown; height?: unknown; title?: unknown };
   try {
-    header = JSON.parse(lines[0] ?? "{}");
+    const h: unknown = JSON.parse(lines[0] ?? "{}");
+    if (h === null || typeof h !== "object" || Array.isArray(h)) throw new Error("not an object");
+    header = h;
   } catch {
     throw new Error("Not an asciinema recording (bad header)");
   }
@@ -45,9 +55,9 @@ export function parseCast(text: string, idleCap = 2): Cast {
     events.push({ t, at, code: v[1], data: String(v[2] ?? "") });
   }
   return {
-    width: header.width && header.width > 0 ? header.width : 80,
-    height: header.height && header.height > 0 ? header.height : 24,
-    title: header.title ?? "",
+    width: clampDim(header.width, MAX_COLS, 80),
+    height: clampDim(header.height, MAX_ROWS, 24),
+    title: typeof header.title === "string" ? header.title : "",
     events,
     duration: events.length ? events[events.length - 1].at : 0,
   };

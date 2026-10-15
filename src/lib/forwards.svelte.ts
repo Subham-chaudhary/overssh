@@ -156,11 +156,33 @@ export function addRule(fields: Omit<ForwardRule, "id">): ForwardRule {
   return rule;
 }
 
+/** The fields that decide which listener is open: changing one of them on a running rule needs a restart. */
+const TUNNEL_FIELDS = ["host", "kind", "bindAddress", "bindPort", "targetHost", "targetPort"] as const;
+
 export function updateRule(id: string, patch: Partial<Omit<ForwardRule, "id">>): void {
   const rule = forwardStore.rules.find((r) => r.id === id);
   if (!rule) return;
+  const reshaped = runtimeOf(id).status === "running" && TUNNEL_FIELDS.some((k) => k in patch && patch[k] !== rule[k]);
   Object.assign(rule, patch);
   scheduleSave();
+  // The open listener still has the old shape: reopen it with the edited one, so the list never
+  // shows a rule as running on a port / target it is not using.
+  if (reshaped) void reopenRule(id);
+}
+
+/** Closes the listener of a running rule and starts it again from the (edited) rule, keeping the tunnel session. */
+async function reopenRule(id: string): Promise<void> {
+  const rt = runtimeOf(id);
+  if (rt.status !== "running" || !rt.forwardId) return;
+  const { forwardId, sessionId } = rt;
+  setRuntime(id, { status: "stopped", forwardId: null, error: null, activeConnections: 0 });
+  try {
+    await api.forwardStop(forwardId);
+  } catch (err) {
+    app.addToast("error", errorMessage(err));
+  }
+  await startRule(id);
+  if (sessionId) releaseTunnel(sessionId); // the host may have changed: close the old tunnel session if nothing uses it
 }
 
 export async function removeRule(id: string): Promise<void> {

@@ -1,5 +1,5 @@
 // Small presentation helpers shared by the Docker components.
-import type { Container, PortMapping } from "./parse";
+import type { Container, DockerImage, PortMapping } from "./parse";
 import { portLabel } from "./parse";
 
 export function dotClass(c: Pick<Container, "state" | "health">): string {
@@ -15,6 +15,12 @@ export function dotClass(c: Pick<Container, "state" | "health">): string {
     default:
       return "bg-muted-foreground/50";
   }
+}
+
+/** Name of an image row: `repo:tag`, `repo@id` for an image pulled by digest, `<none> id` when dangling. */
+export function imageLabel(i: Pick<DockerImage, "dangling" | "tag" | "repository" | "ref" | "id">): string {
+  if (i.dangling) return `<none> ${i.id}`;
+  return i.tag === "<none>" ? `${i.repository}@${i.id}` : i.ref;
 }
 
 export function matches(filter: string, ...fields: Array<string | undefined>): boolean {

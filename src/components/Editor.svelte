@@ -4,6 +4,12 @@
   interface ModelEntry {
     model: Monaco.editor.ITextModel;
     viewState: Monaco.editor.ICodeEditorViewState | null;
+    /** The `tab.doc` value the model was last synced with. Monaco normalizes
+     * mixed line endings, so `model.getValue()` can differ from `tab.doc` for
+     * an untouched file; compare against this instead. */
+    syncedDoc: string;
+    /** True while we push `tab.doc` into the model ourselves (no user edit). */
+    applying: boolean;
   }
 
   // Module-scoped (NOT per-component-instance) registry of live Monaco
@@ -46,6 +52,7 @@
   let editor: Monaco.editor.IStandaloneCodeEditor | undefined;
   let ready = $state(false);
   let currentTabId: string | null = null;
+  let saveAction: Monaco.IDisposable | undefined;
 
   const tab = $derived(app.activeTab);
   const cmp = $derived(tab ? app.compare[tab.id] : undefined);
@@ -75,7 +82,15 @@
     if (existing) {
       // Picks up doc changes that happened while this tab wasn't the active
       // one (e.g. the conflict dialog's "Reload" resolving a background tab).
-      if (existing.model.getValue() !== t.doc) existing.model.setValue(t.doc);
+      if (existing.syncedDoc !== t.doc) {
+        existing.syncedDoc = t.doc;
+        existing.applying = true;
+        try {
+          existing.model.setValue(t.doc);
+        } finally {
+          existing.applying = false;
+        }
+      }
       return existing.model;
     }
     // `query` = tab id keeps the URI unique per tab: a tab retargeted by a rename
@@ -87,12 +102,17 @@
       tabSize: settings.editor.tabSize,
       insertSpaces: settings.editor.insertSpaces,
     });
+    const entry: ModelEntry = { model, viewState: null, syncedDoc: t.doc, applying: false };
     model.onDidChangeContent(() => {
+      // A programmatic sync is not an edit: keep tab.doc as the server text
+      // (Monaco may have normalized its line endings).
+      if (entry.applying) return;
       const value = model.getValue();
+      entry.syncedDoc = value;
       if (value !== t.doc) t.doc = value;
       scheduleAfterDelay(t);
     });
-    models.set(t.id, { model, viewState: null });
+    models.set(t.id, entry);
     return model;
   }
 
@@ -154,9 +174,18 @@
       // keybinding service and bubbles to `window` for the app's command
       // palette instead. All other App.svelte shortcuts (Ctrl+W, Ctrl+`,
       // Ctrl+,, F5) aren't bound by Monaco at all, so they already bubble.
-      editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, () => {
-        const activeId = app.activeWorkspace?.activeTabId;
-        if (activeId) void app.saveTab(activeId);
+      // `addAction`, not `addCommand`: addCommand registers a global keybinding
+      // that is never removed and the last one wins, so DiffView's Ctrl+S
+      // (bound to a disposed diff model after it closed) shadowed this one.
+      // An action's keybinding is scoped to this editor and disposable.
+      saveAction = editor.addAction({
+        id: "overssh.save",
+        label: "Save",
+        keybindings: [m.KeyMod.CtrlCmd | m.KeyCode.KeyS],
+        run: () => {
+          const activeId = app.activeWorkspace?.activeTabId;
+          if (activeId) void app.saveTab(activeId);
+        },
       });
 
       editor.onDidBlurEditorText(() => onEditorBlur(currentTabId));
@@ -179,6 +208,7 @@
   onDestroy(() => {
     // The editor widget is torn down, but models are module-scoped and
     // intentionally left alive — see the comment on `models` above.
+    saveAction?.dispose();
     editor?.dispose();
     if (activeEditor === editor) activeEditor = null;
     editor = undefined;
@@ -310,7 +340,7 @@
     </div>
   {/if}
   {#if tab && cmp}
-    {#key cmp.serverMtime + ":" + cmp.serverContent.length}
+    {#key tab.id + ":" + cmp.serverMtime + ":" + cmp.serverContent.length}
       <div class="min-h-0 flex-1"><DiffView {tab} state={cmp} /></div>
     {/key}
   {/if}

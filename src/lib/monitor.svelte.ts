@@ -42,6 +42,8 @@ class MonitorStore {
   showThreads = $state(false);
   /** Snapshot frozen at the moment the user paused, shown instead of the live one. */
   frozen = $state<MonitorSnapshot | null>(null);
+  /** The session `frozen` belongs to: pausing is per VM, it must not follow a switch to another one. */
+  private frozenId: string | null = null;
   private pickedId = $state<string | null>(null);
 
   private viewMounts = 0;
@@ -66,6 +68,7 @@ class MonitorStore {
   /** Auto-reconnect (§13.4.A): the session came back under a new id. */
   remapSession(oldId: string, newId: string): void {
     if (this.pickedId === oldId) this.pickedId = newId;
+    if (this.frozenId === oldId) this.frozenId = newId;
     this.started.delete(oldId);
     delete this.snapshots[oldId];
     delete this.history[oldId];
@@ -85,7 +88,7 @@ class MonitorStore {
   get viewSnapshot(): MonitorSnapshot | null {
     const id = this.selectedId;
     if (!id) return null;
-    if (this.paused && this.frozen) return this.frozen;
+    if (this.paused && this.frozen && this.frozenId === id) return this.frozen;
     return this.snapshots[id] ?? null;
   }
 
@@ -93,6 +96,7 @@ class MonitorStore {
     const id = this.selectedId;
     this.paused = p;
     this.frozen = p && id ? (this.snapshots[id] ?? null) : null;
+    this.frozenId = p ? id : null;
     this.sync();
   }
 
@@ -135,6 +139,12 @@ class MonitorStore {
   }
 
   private doSync(): void {
+    // The selection moved to another VM (active workspace changed) while paused: that VM is live.
+    if (this.paused && this.frozenId !== this.selectedId) {
+      this.paused = false;
+      this.frozen = null;
+      this.frozenId = null;
+    }
     const want = new Map<string, { ms: number; threads: boolean; procs: boolean }>();
     if (!this.asleep) {
       if (this.sidebarMounts > 0) for (const s of app.sessions) want.set(s.id, { ms: SLOW_MS, threads: false, procs: false });

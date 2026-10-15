@@ -46,7 +46,11 @@ export function scheduleAfterDelay(tab: Tab): void {
   const timer = setTimeout(() => {
     delayTimers.delete(tabId);
     const t = findTab(tabId);
-    if (t && settings.files.autoSave === "afterDelay" && isDirty(t)) saveAuto(tabId);
+    if (!t || settings.files.autoSave !== "afterDelay" || !isDirty(t)) return;
+    // An autosave is a no-op while another write is in flight; edits typed
+    // during that write would then wait for the next keystroke. Try again later.
+    if (t.saving) scheduleAfterDelay(t);
+    else saveAuto(tabId);
   }, Math.max(0, settings.files.autoSaveDelay));
   delayTimers.set(tab.id, timer);
 }

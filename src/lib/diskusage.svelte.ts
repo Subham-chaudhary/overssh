@@ -5,6 +5,7 @@
 
 import * as api from "./api";
 import { dirname } from "./paths";
+import { app } from "./stores.svelte";
 import type { DuDoneEvent, DuEntry } from "./types";
 
 export const DU_DEPTHS = [1, 2, 3, 4] as const;
@@ -259,9 +260,19 @@ class DiskUsageStore {
     }
     return s;
   }
+
+  /** The session is gone (closed, or replaced by a reconnect): stop its scan and free the size map. */
+  forget(sessionId: string): void {
+    const s = this.bySession[sessionId];
+    if (!s) return;
+    void s.cancel();
+    delete this.bySession[sessionId];
+  }
 }
 
 export const diskUsage = new DiskUsageStore();
+app.onSessionLost((id) => diskUsage.forget(id));
+app.onSessionRemap((oldId) => diskUsage.forget(oldId));
 
 export function fmtKb(kb: number): string {
   const b = kb * 1024;

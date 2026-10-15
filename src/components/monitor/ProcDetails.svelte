@@ -48,9 +48,12 @@
     loadedPid = pid;
   }
 
+  // `proc` is a new object on every snapshot; the effects below must follow only its pid, or they
+  // would restart (and read /proc on the VM) once per snapshot instead of once per pid / 5 s.
+  const procPid = $derived(proc.pid);
   // Load when the selected pid changes (debounced so arrow-key scrolling stays cheap).
   $effect(() => {
-    const pid = proc.pid;
+    const pid = procPid;
     if (untrack(() => loadedPid) !== pid) d = null;
     const t = setTimeout(() => void load(pid), 150);
     return () => clearTimeout(t);
@@ -58,8 +61,11 @@
   // Light auto-refresh while open and live.
   $effect(() => {
     if (paused) return;
-    const pid = proc.pid;
-    const t = setInterval(() => void load(pid), 5000);
+    const pid = procPid;
+    // Not while the window is hidden / minimized: nobody sees it and each call is a channel on the VM (§17.3).
+    const t = setInterval(() => {
+      if (!document.hidden) void load(pid);
+    }, 5000);
     return () => clearInterval(t);
   });
 

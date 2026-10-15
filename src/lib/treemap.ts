@@ -37,12 +37,12 @@ function worst(areas: number[], side: number): number {
 }
 
 /**
- * Lays `items` out inside `box`. Items with value <= 0 are dropped. Areas are
+ * Lays `items` out inside `box`. Items with value <= 0 or a non-finite value are dropped. Areas are
  * proportional to values and exactly tile the box. Output keeps descending
  * value order.
  */
 export function squarify(items: TmItem[], box: Box): TmRect[] {
-  const list = items.filter((i) => i.value > 0).sort((a, b) => b.value - a.value);
+  const list = items.filter((i) => i.value > 0 && Number.isFinite(i.value)).sort((a, b) => b.value - a.value);
   const total = list.reduce((s, i) => s + i.value, 0);
   if (!list.length || total <= 0 || box.w <= 0 || box.h <= 0) return [];
   const scale = (box.w * box.h) / total;
@@ -52,6 +52,12 @@ export function squarify(items: TmItem[], box: Box): TmRect[] {
 
   let i = 0;
   while (i < list.length) {
+    // The leftovers of a very lopsided input (one item holds ~all the area) round to nothing: stop
+    // instead of dividing by a zero side, which would give NaN rectangles.
+    if (!(w > 0) || !(h > 0)) {
+      for (; i < list.length; i++) out.push({ id: list[i].id, x, y, w: 0, h: 0, value: list[i].value });
+      break;
+    }
     const side = Math.min(w, h);
     let end = i + 1;
     let row = [areas[i]];

@@ -5,7 +5,7 @@
   import { onMount } from "svelte";
   import { dockerStore } from "$lib/docker/docker.svelte";
   import { projectServices, isRunning, formatBytes, type Container } from "$lib/docker/parse";
-  import { dotClass, matches, portsSummary, LIST_CAP } from "$lib/docker/ui";
+  import { dotClass, imageLabel, matches, portsSummary, LIST_CAP } from "$lib/docker/ui";
   import { settings } from "$lib/settings.svelte";
   import DockerState from "./DockerState.svelte";
   import DockerMenu, { type MenuItem } from "./DockerMenu.svelte";
@@ -239,7 +239,7 @@
             class={`flex w-full items-center gap-1.5 py-0.5 pr-2 pl-4 text-left hover:bg-muted/50 ${isSel("image", i.id) ? "bg-accent" : ""}`}
             onclick={() => sel("image", i.id)}
           >
-            <span class={`min-w-0 flex-1 truncate ${i.dangling ? "text-muted-foreground italic" : ""}`}>{i.dangling ? `<none> ${i.id}` : i.ref}</span>
+            <span class={`min-w-0 flex-1 truncate ${i.dangling ? "text-muted-foreground italic" : ""}`}>{imageLabel(i)}</span>
             <span class="flex-none font-mono text-[10px] text-muted-foreground">{i.sizeText || formatBytes(i.size)}</span>
           </button>
         {/each}

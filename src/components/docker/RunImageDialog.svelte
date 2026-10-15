@@ -38,8 +38,9 @@
     wasOpen = o;
   });
 
-  const lines = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
-  const args = $derived(buildRunArgs({ image, name, ports: lines(ports), env: lines(env.replace(/,/g, "\n")), volumes: lines(volumes), detach, restart, rm, command }));
+  // One entry per line only: a comma belongs to the value (`ALLOWED=a.com,b.com`, `-v /h:/c:ro,z`).
+  const lines = (s: string) => s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  const args = $derived(buildRunArgs({ image, name, ports: lines(ports), env: lines(env), volumes: lines(volumes), detach, restart, rm, command }));
   const valid = $derived(image.trim() !== "");
 
   async function go(): Promise<void> {

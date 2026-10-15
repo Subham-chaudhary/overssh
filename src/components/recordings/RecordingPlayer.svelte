@@ -9,7 +9,7 @@
   import { Button } from "$lib/components/ui/button/index.js";
   import PlayIcon from "@lucide/svelte/icons/play";
   import PauseIcon from "@lucide/svelte/icons/pause";
-  import { parseCast, formatClock, type Cast } from "./cast";
+  import { parseCast, formatClock, clampDim, MAX_COLS, MAX_ROWS, type Cast } from "./cast";
 
   let { text }: { text: string } = $props();
 
@@ -32,7 +32,7 @@
     if (code === "o") term.write(data);
     else if (code === "r") {
       const m = /^(\d+)x(\d+)$/.exec(data);
-      if (m) term.resize(Number(m[1]), Number(m[2]));
+      if (m) term.resize(clampDim(Number(m[1]), MAX_COLS, term.cols), clampDim(Number(m[2]), MAX_ROWS, term.rows));
     }
   }
 

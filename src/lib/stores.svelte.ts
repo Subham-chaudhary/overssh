@@ -1386,14 +1386,17 @@ class AppState {
       // the server to conflict with — saving it should just recreate the
       // file, the same as passing no `expectedMtime` at all.
       const skipConflictCheck = overwrite || tab.missing === true;
+      // The text that is written: edits typed while the write is in flight stay
+      // dirty (and autosave picks them up), instead of being marked saved unwritten.
+      const doc = tab.doc;
       const newMtime = await api.writeFile(
         tab.sessionId,
         tab.path,
-        tab.doc,
+        doc,
         skipConflictCheck ? undefined : tab.mtime,
       );
       tab.mtime = newMtime;
-      tab.savedDoc = tab.doc;
+      tab.savedDoc = doc;
       tab.autoSavePaused = false;
       const recreated = tab.missing === true;
       tab.missing = false;
@@ -1456,14 +1459,15 @@ class AppState {
     if (password === null) return; // cancelled
     tab.saving = true;
     try {
+      const doc = tab.doc; // as in saveTab: later edits stay dirty
       const newMtime = await api.writeFileSudo(
         tab.sessionId,
         tab.path,
-        tab.doc,
+        doc,
         password || undefined,
       );
       tab.mtime = newMtime;
-      tab.savedDoc = tab.doc;
+      tab.savedDoc = doc;
       tab.autoSavePaused = false;
       tab.missing = false;
       if (this.conflict?.tabId === tab.id) this.conflict = null;

@@ -29,6 +29,7 @@ export const EV = {
   ctx: "termwin://ctx",
   settings: "termwin://settings",
   remap: "termwin://remap",
+  lost: "termwin://lost",
   open: "termwin://open",
   reopen: "termwin://reopen",
   activate: "termwin://activate",
@@ -224,6 +225,7 @@ export function initMain(): void {
     reopen: () => void api.emitEvent(EV.reopen),
     activate: (id) => void api.emitEvent(EV.activate, { id }),
     remap: (oldId, newId) => void api.emitEvent(EV.remap, { oldId, newId }),
+    lost: (sessionId) => void api.emitEvent(EV.lost, { sessionId }),
     focusWindow: () => void api.termWindowFocus().catch(() => undefined),
     split: (dir) => {
       void api.termWindowFocus().catch(() => undefined);
@@ -348,6 +350,7 @@ export async function initTerminalWindow(): Promise<void> {
     api.listenEvent<{ oldId: string; newId: string }>(EV.remap, (p) => {
       void terminalStore.rebindSession(p.oldId, p.newId);
     }),
+    api.listenEvent<{ sessionId: string }>(EV.lost, (p) => terminalStore.sessionLost(p.sessionId)),
     api.listenEvent<OpenRequest>(EV.open, async (req) => {
       try {
         const id = await terminalStore.openNew(req.sessionId, req.opts);

@@ -221,6 +221,13 @@ class CronStore {
     }
     return s;
   }
+
+  /** The session is gone (closed, or replaced by a reconnect): drop its crontab state. */
+  forget(sessionId: string): void {
+    delete this.bySession[sessionId];
+  }
 }
 
 export const cronStore = new CronStore();
+app.onSessionLost((id) => cronStore.forget(id));
+app.onSessionRemap((oldId) => cronStore.forget(oldId));

@@ -152,3 +152,13 @@ export function formatDate(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
+
+/**
+ * Variable names that look like they hold a secret ({{password}}, {{db_token}}, {{API_KEY}} ...).
+ * Their values are not remembered with the snippet and a command that used one is not added to the
+ * command history: both are written to disk in plain text (and the history can be exported).
+ */
+export function isSecretName(name: string): boolean {
+  const n = name.toLowerCase();
+  return /password|passwd|passphrase|secret|token|api[_.-]?key|credential|private[_.-]?key/.test(n) || /(^|[_.-])(pass|pwd)($|[_.-])/.test(n);
+}

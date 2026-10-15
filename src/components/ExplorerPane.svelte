@@ -211,7 +211,8 @@
       case "X": {
         if (!(e.ctrlKey || e.metaKey) || e.altKey) break;
         const path = explorer.selected;
-        if (!path || idx < 0) break;
+        // Not on the ".." row (no data-parent): it is not an entry of this folder.
+        if (!path || idx < 0 || !rows[idx].hasAttribute("data-parent")) break;
         e.preventDefault();
         if (e.shiftKey && e.key.toLowerCase() === "c") {
           void app.copyPath(path); // Ctrl+Shift+C: copy the path text

@@ -50,13 +50,17 @@
     return dockerStore.run(["exec", c.id, ...args]);
   }
 
+  /** Only the newest listing may fill the page: a slow answer for an earlier folder must not replace it. */
+  let listSeq = 0;
   async function list(path: string): Promise<void> {
+    const my = ++listSeq;
     loading = true;
     error = "";
     try {
       const target = path.endsWith("/") ? path : `${path}/`;
       let out = await exec(["ls", "-la", "--time-style=+%s", target]);
       if (lsNeedsFallback(out.code, out.stderr)) out = await exec(["ls", "-la", target]);
+      if (my !== listSeq) return;
       if (out.code !== 0) {
         error = friendlyDockerError(out.stderr, `Cannot list ${path}`);
         return;
@@ -65,9 +69,9 @@
       dir = path;
       pathInput = path;
     } catch (e) {
-      error = e instanceof Error ? e.message : String((e as { message?: string }).message ?? e);
+      if (my === listSeq) error = e instanceof Error ? e.message : String((e as { message?: string }).message ?? e);
     } finally {
-      loading = false;
+      if (my === listSeq) loading = false;
     }
   }
 

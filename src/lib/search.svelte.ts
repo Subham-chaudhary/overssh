@@ -30,6 +30,8 @@ export const searchStore = $state({
   /** Session + root the current results belong to (click opens in this session). */
   resultSessionId: null as string | null,
   resultRoot: "",
+  /** The query and flags the current results were found with (the inputs may be edited since). */
+  resultQuery: { query: "", caseSensitive: false, wholeWord: false, regex: false },
   groups: [] as SearchGroup[],
   total: 0,
   truncated: false,
@@ -112,6 +114,12 @@ export async function runSearch(): Promise<void> {
   searchStore.running = true;
   searchStore.resultSessionId = sid;
   searchStore.resultRoot = root;
+  searchStore.resultQuery = {
+    query: searchStore.query,
+    caseSensitive: searchStore.caseSensitive,
+    wholeWord: searchStore.wholeWord,
+    regex: searchStore.regex,
+  };
   searchStore.searchId = null;
   starting = true;
   early = [];
@@ -167,14 +175,16 @@ export function clearResults(): void {
 }
 
 /** Builds the RegExp used to highlight matches in a result line (same
- * semantics as the request flags). Returns null if the pattern is invalid. */
+ * semantics as the flags of the search that found them, not the inputs as
+ * edited since). Returns null if the pattern is invalid. */
 export function highlightRegex(): RegExp | null {
-  const q = searchStore.query;
+  const o = searchStore.resultQuery;
+  const q = o.query;
   if (!q) return null;
-  let src = searchStore.regex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (searchStore.wholeWord) src = `\\b(?:${src})\\b`;
+  let src = o.regex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (o.wholeWord) src = `\\b(?:${src})\\b`;
   try {
-    return new RegExp(src, searchStore.caseSensitive ? "g" : "gi");
+    return new RegExp(src, o.caseSensitive ? "g" : "gi");
   } catch {
     return null;
   }

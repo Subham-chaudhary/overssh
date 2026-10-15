@@ -89,6 +89,9 @@ function readView(): "list" | "tree" {
   }
 }
 
+/** Runs git in the repo an operation was started in; `current()` tells whether it is still the one on screen. */
+type OpRunner = ((args: string[], stdin?: string) => Promise<string>) & { current(): boolean };
+
 class GitStore {
   /** Repo root (`git rev-parse --show-toplevel`) per session id; null = not a repo. */
   repos = $state<Record<string, string | null>>({});
@@ -452,18 +455,31 @@ class GitStore {
 
   // --- mutation plumbing -----------------------------------------------------------
 
-  /** Queues a mutation (git takes index.lock, so one at a time), then refreshes. */
+  /**
+   * Queues a mutation (git takes index.lock, so one at a time), then refreshes. `fn` gets a runner
+   * bound to the session and repo that were active when the mutation was requested: it may run
+   * later (queue) and take several steps (Sync), and the user can switch session meanwhile.
+   */
   private op<T>(
     label: string,
-    fn: () => Promise<T>,
+    fn: (run: OpRunner) => Promise<T>,
     o: { silent?: boolean; success?: string; full?: boolean } = {},
   ): Promise<T | undefined> {
+    const sid = this.sessionId;
+    const repo = this.repo;
+    const run: OpRunner = Object.assign(
+      async (args: string[], stdin?: string): Promise<string> => {
+        if (!sid || !repo) throw new Error("No repository");
+        return this.runIn(sid, repo, args, stdin);
+      },
+      { current: () => this.sessionId === sid && this.repo === repo },
+    );
     this.pendingOps++;
     const job = this.chain.then(async (): Promise<T | undefined> => {
       this.busy = label;
       if (!o.silent) this.lastError = null;
       try {
-        const r = await fn();
+        const r = await fn(run);
         if (o.success) toast.success(o.success);
         return r;
       } catch (e) {
@@ -516,32 +532,32 @@ class GitStore {
   stage(changes: Change[]): Promise<void | undefined> {
     const paths = [...new Set(changes.map((c) => c.path))];
     if (paths.length === 0) return Promise.resolve(undefined);
-    return this.op("Stage", async () => {
-      for (const part of chunks(paths)) await this.run(["add", "--", ...part]);
+    return this.op("Stage", async (run) => {
+      for (const part of chunks(paths)) await run(["add", "--", ...part]);
     });
   }
 
   unstage(changes: Change[]): Promise<void | undefined> {
     const paths = [...new Set(changes.flatMap((c) => (c.origPath ? [c.path, c.origPath] : [c.path])))];
     if (paths.length === 0) return Promise.resolve(undefined);
-    return this.op("Unstage", async () => {
+    return this.op("Unstage", async (run) => {
       for (const part of chunks(paths)) {
-        if (this.unborn) await this.run(["rm", "--cached", "-r", "-q", "--", ...part]);
-        else await this.run(["restore", "--staged", "--", ...part]);
+        if (run.current() && this.unborn) await run(["rm", "--cached", "-r", "-q", "--", ...part]);
+        else await run(["restore", "--staged", "--", ...part]);
       }
     });
   }
 
   stageAll(): Promise<void | undefined> {
-    return this.op("Stage All", async () => {
-      await this.run(["add", "-A"]);
+    return this.op("Stage All", async (run) => {
+      await run(["add", "-A"]);
     });
   }
 
   unstageAll(): Promise<void | undefined> {
-    return this.op("Unstage All", async () => {
-      if (this.unborn) await this.run(["rm", "--cached", "-r", "-q", "--", "."]);
-      else await this.run(["restore", "--staged", "--", "."]);
+    return this.op("Unstage All", async (run) => {
+      if (run.current() && this.unborn) await run(["rm", "--cached", "-r", "-q", "--", "."]);
+      else await run(["restore", "--staged", "--", "."]);
     });
   }
 
@@ -565,9 +581,9 @@ class GitStore {
     }
     const tracked = list.filter((c) => !c.untracked).map((c) => c.path);
     const loose = list.filter((c) => c.untracked).map((c) => c.path);
-    await this.op("Discard", async () => {
-      for (const part of chunks(tracked)) await this.run(["restore", "--", ...part]);
-      for (const part of chunks(loose)) await this.run(["clean", "-f", "--", ...part]);
+    await this.op("Discard", async (run) => {
+      for (const part of chunks(tracked)) await run(["restore", "--", ...part]);
+      for (const part of chunks(loose)) await run(["clean", "-f", "--", ...part]);
     });
   }
 
@@ -643,8 +659,8 @@ class GitStore {
     const signOff = this.signOff;
     await this.op(
       amend ? "Amend" : "Commit",
-      async () => {
-        if (stageFirst) await this.run(["add", "-A"]);
+      async (run) => {
+        if (stageFirst) await run(["add", "-A"]);
         const args = ["commit"];
         if (signOff) args.push("--signoff");
         if (amend) args.push("--amend");
@@ -654,9 +670,11 @@ class GitStore {
           args.push("-F", "-");
           stdin = `${msg}\n`;
         }
-        await this.run(args, stdin);
-        this.message = "";
-        this.amend = false;
+        await run(args, stdin);
+        if (run.current()) {
+          this.message = "";
+          this.amend = false;
+        }
       },
       { success: amend ? "Commit amended" : "Committed" },
     );
@@ -665,17 +683,17 @@ class GitStore {
   /** Undo Last Commit: `reset --soft HEAD~1`, the message goes back into the box. */
   async undoLastCommit(): Promise<void> {
     if (!this.head.sha) return;
-    await this.op("Undo Commit", async () => {
-      const last = (await this.run(["log", "-1", "--format=%B"])).trimEnd();
+    await this.op("Undo Commit", async (run) => {
+      const last = (await run(["log", "-1", "--format=%B"])).trimEnd();
       let hasParent = true;
       try {
-        await this.run(["rev-parse", "--verify", "-q", "HEAD~1"]);
+        await run(["rev-parse", "--verify", "-q", "HEAD~1"]);
       } catch {
         hasParent = false;
       }
-      if (hasParent) await this.run(["reset", "--soft", "HEAD~1"]);
-      else await this.run(["update-ref", "-d", "HEAD"]);
-      if (this.message.trim() === "") this.message = last;
+      if (hasParent) await run(["reset", "--soft", "HEAD~1"]);
+      else await run(["update-ref", "-d", "HEAD"]);
+      if (run.current() && this.message.trim() === "") this.message = last;
     });
   }
 
@@ -693,8 +711,8 @@ class GitStore {
     if (!name) return null;
     const url = (await app.ask({ title: "Add Remote", message: `URL for "${name}"`, input: {}, confirmLabel: "Add" }))?.trim();
     if (!url) return null;
-    const ok = await this.op("Add Remote", async () => {
-      await this.run(["remote", "add", name, url]);
+    const ok = await this.op("Add Remote", async (run) => {
+      await run(["remote", "add", name, url]);
       return true;
     });
     return ok ? name : null;
@@ -703,12 +721,12 @@ class GitStore {
   fetch(o: { silent?: boolean; remote?: string } = {}): Promise<void | undefined> {
     return this.op(
       "Fetch",
-      async () => {
+      async (run) => {
         const args = ["fetch"];
         if (settings.git.pruneOnFetch) args.push("--prune");
         if (o.remote) args.push(o.remote);
         else if (this.remotes.length > 1) args.push("--all");
-        await this.run(args);
+        await run(args);
       },
       { silent: o.silent, success: o.silent ? undefined : "Fetched", full: true },
     );
@@ -730,7 +748,7 @@ class GitStore {
       return;
     }
     if (!(await this.confirmSync(`Pull from "${up}"${settings.git.pullRebase ? " (rebase)" : ""}?`, "Pull"))) return;
-    await this.op("Pull", async () => void (await this.run(this.pullArgs())), { success: "Pulled" });
+    await this.op("Pull", async (run) => void (await run(this.pullArgs())), { success: "Pulled" });
   }
 
   /** Remote to publish to: the existing one, or ask the user to add one. */
@@ -764,7 +782,7 @@ class GitStore {
       if (!(await this.confirmSync(`Publish "${branch}" to "${remote}"?`, "Publish"))) return;
       args = ["push", ...(o.force ? ["--force-with-lease"] : []), "-u", remote, branch];
     }
-    await this.op("Push", async () => void (await this.run(args)), { success: up ? "Pushed" : `Published ${branch}` });
+    await this.op("Push", async (run) => void (await run(args)), { success: up ? "Pushed" : `Published ${branch}` });
   }
 
   async sync(): Promise<void> {
@@ -781,10 +799,10 @@ class GitStore {
     if (!(await this.confirmSync(`This pulls and pushes commits from and to "${up}".`, "Sync"))) return;
     await this.op(
       "Sync",
-      async () => {
-        await this.run(this.pullArgs());
-        const counts = (await this.run(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])).trim().split(/\s+/);
-        if (Number(counts[0]) > 0) await this.run(["push"]);
+      async (run) => {
+        await run(this.pullArgs());
+        const counts = (await run(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])).trim().split(/\s+/);
+        if (Number(counts[0]) > 0) await run(["push"]);
       },
       { success: "Synced" },
     );
@@ -811,15 +829,15 @@ class GitStore {
     const args = ["stash", "push"];
     if (o.includeUntracked) args.push("--include-untracked");
     if (msg) args.push("-m", msg);
-    await this.op("Stash", async () => void (await this.run(args)), { success: "Changes stashed" });
+    await this.op("Stash", async (run) => void (await run(args)), { success: "Changes stashed" });
   }
 
   stashApply(ref: string): Promise<void | undefined> {
-    return this.op("Apply Stash", async () => void (await this.run(["stash", "apply", ref])), { success: "Stash applied" });
+    return this.op("Apply Stash", async (run) => void (await run(["stash", "apply", ref])), { success: "Stash applied" });
   }
 
   stashPop(ref: string): Promise<void | undefined> {
-    return this.op("Pop Stash", async () => void (await this.run(["stash", "pop", ref])), { success: "Stash popped" });
+    return this.op("Pop Stash", async (run) => void (await run(["stash", "pop", ref])), { success: "Stash popped" });
   }
 
   async stashDrop(ref: string): Promise<void> {
@@ -830,18 +848,26 @@ class GitStore {
       danger: true,
     });
     if (!ok) return;
-    await this.op("Drop Stash", async () => void (await this.run(["stash", "drop", ref])));
+    await this.op("Drop Stash", async (run) => void (await run(["stash", "drop", ref])));
   }
 
   // --- branches and tags -------------------------------------------------------------
 
   /** `target` is a local branch, a remote branch ("origin/x", checked out as a tracking branch) or a tag. */
   async checkout(target: string, o: { remote?: boolean; detach?: boolean } = {}): Promise<void> {
+    if (o.remote) {
+      // `checkout --track origin/x` fails when a local `x` exists: switch to that branch instead.
+      const short = this.refs.remote.find((r) => r.name === target)?.short;
+      if (short && this.refs.local.some((b) => b.name === short)) {
+        target = short;
+        o = {};
+      }
+    }
     const args = ["checkout"];
     if (o.remote) args.push("--track");
     if (o.detach) args.push("--detach");
     args.push(target);
-    await this.op("Checkout", async () => void (await this.run(args)), { success: `Switched to ${target}` });
+    await this.op("Checkout", async (run) => void (await run(args)), { success: `Switched to ${target}` });
   }
 
   async createBranch(o: { from?: string; name?: string; checkout?: boolean } = {}): Promise<void> {
@@ -861,7 +887,7 @@ class GitStore {
     const checkout = o.checkout ?? true;
     const args = checkout ? ["checkout", "-b", name] : ["branch", name];
     if (o.from) args.push(o.from);
-    await this.op("Create Branch", async () => void (await this.run(args)), { success: `Created ${name}` });
+    await this.op("Create Branch", async (run) => void (await run(args)), { success: `Created ${name}` });
   }
 
   async renameBranch(old: string): Promise<void> {
@@ -869,7 +895,7 @@ class GitStore {
       await app.ask({ title: "Rename Branch", message: `Rename "${old}" to`, input: { value: old }, confirmLabel: "Rename" })
     )?.trim();
     if (!name || name === old) return;
-    await this.op("Rename Branch", async () => void (await this.run(["branch", "-m", old, name])));
+    await this.op("Rename Branch", async (run) => void (await run(["branch", "-m", old, name])));
   }
 
   async deleteBranch(name: string, force = false): Promise<void> {
@@ -882,7 +908,7 @@ class GitStore {
       danger: true,
     });
     if (!ok) return;
-    await this.op("Delete Branch", async () => void (await this.run(["branch", force ? "-D" : "-d", name])), {
+    await this.op("Delete Branch", async (run) => void (await run(["branch", force ? "-D" : "-d", name])), {
       success: `Deleted ${name}`,
     });
   }
@@ -895,40 +921,40 @@ class GitStore {
       danger: true,
     });
     if (!ok) return;
-    await this.op("Delete Remote Branch", async () => void (await this.run(["push", remote, "--delete", short])));
+    await this.op("Delete Remote Branch", async (run) => void (await run(["push", remote, "--delete", short])));
   }
 
   async mergeInto(name: string): Promise<void> {
-    await this.op("Merge", async () => void (await this.run(["merge", "--no-edit", name])), {
+    await this.op("Merge", async (run) => void (await run(["merge", "--no-edit", name])), {
       success: `Merged ${name}`,
     });
   }
 
   async rebaseOnto(name: string): Promise<void> {
-    await this.op("Rebase", async () => void (await this.run(["rebase", name])), { success: `Rebased onto ${name}` });
+    await this.op("Rebase", async (run) => void (await run(["rebase", name])), { success: `Rebased onto ${name}` });
   }
 
   rebaseControl(action: "--abort" | "--continue" | "--skip"): Promise<void | undefined> {
     return this.op(
       "Rebase",
-      async () => void (await this.run(["-c", "core.editor=true", "rebase", action])),
+      async (run) => void (await run(["-c", "core.editor=true", "rebase", action])),
     );
   }
 
   /** Continue / skip / abort for cherry-pick, revert and am (no editor opens: core.editor=true). */
   sequenceControl(op: "cherry-pick" | "revert" | "am", action: "--abort" | "--continue" | "--skip"): Promise<void | undefined> {
     const name = op === "am" ? "Apply Patches" : op === "revert" ? "Revert" : "Cherry-pick";
-    return this.op(name, async () => void (await this.run(["-c", "core.editor=true", op, action])));
+    return this.op(name, async (run) => void (await run(["-c", "core.editor=true", op, action])));
   }
 
   abortMerge(): Promise<void | undefined> {
-    return this.op("Abort Merge", async () => void (await this.run(["merge", "--abort"])));
+    return this.op("Abort Merge", async (run) => void (await run(["merge", "--abort"])));
   }
 
   async publishBranch(name: string): Promise<void> {
     const remote = await this.remoteForPublish();
     if (!remote) return;
-    await this.op("Publish", async () => void (await this.run(["push", "-u", remote, name])), {
+    await this.op("Publish", async (run) => void (await run(["push", "-u", remote, name])), {
       success: `Published ${name}`,
     });
   }
@@ -947,7 +973,7 @@ class GitStore {
         )?.trim() ?? "";
     }
     if (!up) return;
-    await this.op("Set Upstream", async () => void (await this.run(["branch", `--set-upstream-to=${up}`, branch])));
+    await this.op("Set Upstream", async (run) => void (await run(["branch", `--set-upstream-to=${up}`, branch])));
   }
 
   async createTag(at?: string): Promise<void> {
@@ -966,13 +992,13 @@ class GitStore {
     if (msg.trim()) args.push("-a", name, "-m", msg.trim());
     else args.push(name);
     if (at) args.push(at);
-    await this.op("Create Tag", async () => void (await this.run(args)), { success: `Created tag ${name}` });
+    await this.op("Create Tag", async (run) => void (await run(args)), { success: `Created tag ${name}` });
   }
 
   async deleteTag(name: string): Promise<void> {
     const ok = await app.ask({ title: "Delete Tag", message: `Delete tag "${name}"?`, confirmLabel: "Delete", danger: true });
     if (!ok) return;
-    await this.op("Delete Tag", async () => void (await this.run(["tag", "-d", name])));
+    await this.op("Delete Tag", async (run) => void (await run(["tag", "-d", name])));
   }
 
   async pushTag(name: string): Promise<void> {
@@ -981,7 +1007,7 @@ class GitStore {
       toast.error("No remote is configured");
       return;
     }
-    await this.op("Push Tag", async () => void (await this.run(["push", remote, `refs/tags/${name}`])), {
+    await this.op("Push Tag", async (run) => void (await run(["push", remote, `refs/tags/${name}`])), {
       success: `Pushed ${name}`,
     });
   }
