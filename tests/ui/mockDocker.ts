@@ -110,7 +110,7 @@ function psLine(c: FakeContainer): string {
   });
 }
 
-function emitEvent(type: string, action: string, name: string, id: string): void {
+export function emitEvent(type: string, action: string, name: string, id: string): void {
   if (!eventsStreamId) return;
   void emit("docker://events", {
     streamId: eventsStreamId,

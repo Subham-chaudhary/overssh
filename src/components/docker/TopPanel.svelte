@@ -40,7 +40,10 @@
 
   $effect(() => {
     if (!auto) return;
-    const t = setInterval(() => void load(), 3000);
+    // Skip ticks while the window is hidden; each tick is a `docker top` on the VM.
+    const t = setInterval(() => {
+      if (!document.hidden && !loading) void load();
+    }, 3000);
     return () => clearInterval(t);
   });
 </script>

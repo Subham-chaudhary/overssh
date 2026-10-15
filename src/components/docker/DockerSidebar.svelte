@@ -19,9 +19,8 @@
   import Trash2Icon from "@lucide/svelte/icons/trash-2";
   import BroomIcon from "@lucide/svelte/icons/broom";
 
-  onMount(() => {
-    dockerStore.activated = true;
-  });
+  // Streams and refreshes run only while a Docker view is mounted (and the window is visible).
+  onMount(() => dockerStore.use());
 
   const d = $derived(dockerStore.cur);
   const ready = $derived(dockerStore.state === "ready");

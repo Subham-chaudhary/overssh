@@ -659,7 +659,9 @@ export type EventKind = "containers" | "images" | "volumes" | "networks";
 export function eventKind(e: DockerEvent): EventKind | null {
   switch (e.type) {
     case "container":
-      if (e.action.startsWith("exec_") && e.action !== "exec_die") return null;
+      // Healthchecks and `docker exec` send exec_create/start/die every few seconds per
+      // container; none changes a list. (health_status is sent only when health changes.)
+      if (e.action.startsWith("exec_")) return null;
       return "containers";
     case "image":
       return "images";

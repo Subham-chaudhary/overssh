@@ -9,6 +9,7 @@ type H = {
   dockerLogStreams: () => { id: string; target: string; compose: boolean; follow: boolean; opts: Record<string, unknown> }[];
   dockerStreams: () => { stats: number; events: number };
   dockerPushLog: (target: string, text: string) => void;
+  dockerEmitEvent: (type: string, action: string, name: string, id: string) => void;
   dockerState: () => { name: string; state: string }[];
   setReadFileDelay: (ms: number) => void;
 };

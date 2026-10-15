@@ -6,6 +6,10 @@
   import BroomIcon from "@lucide/svelte/icons/broom";
   import DownloadIcon from "@lucide/svelte/icons/download";
   import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
+  import { onMount } from "svelte";
+
+  // `system df` runs only while this page (or the prune dialog) is open.
+  onMount(() => dockerStore.useDf());
 
   const d = $derived(dockerStore.cur);
   const info = $derived(d.info);

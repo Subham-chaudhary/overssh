@@ -71,10 +71,11 @@ pub fn build_command(command: Option<&str>, args: &[String]) -> Result<String, A
 
 /// Wraps a long-running command so it dies when the channel's stdin reaches
 /// EOF (an exec channel without a PTY does not always signal the process on
-/// close, and `docker events` may never write again to notice).
+/// close, and `docker events` may never write again to notice). A command that
+/// leads its own process group (`setsid`) is stopped as a group.
 pub fn stream_wrap(cmd: &str) -> String {
     let script = format!(
-        "exec 3<&0; {cmd} </dev/null & p=$!; {{ cat <&3 >/dev/null; kill $p 2>/dev/null; }} & w=$!; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc"
+        "exec 3<&0; {cmd} </dev/null & p=$!; {{ cat <&3 >/dev/null; kill -- -$p 2>/dev/null || kill $p 2>/dev/null; }} & w=$!; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc"
     );
     format!("sh -c {}", sh_quote(&script))
 }

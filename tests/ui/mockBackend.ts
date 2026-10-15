@@ -25,7 +25,7 @@ mockWindows("main");
 import { gitFake, gitHandlerG2, type GitHandler } from "./fakeGitG2";
 import { syncCommand } from "./mockSync"; // §15.3.Y settings sync (window.__sync)
 import { systemdCommand } from "./mockSystemd"; // §15.3.V systemd services (window.__systemd)
-import { dockerFake, dockerRun, eventsStart as dockerEventsStart, logsStart as dockerLogsStart, pushLog as dockerPushLog, resetDocker, statsStart as dockerStatsStart, streamStop as dockerStreamStop } from "./mockDocker"; // §15.3.D docker
+import { dockerFake, dockerRun, eventsStart as dockerEventsStart, logsStart as dockerLogsStart, pushLog as dockerPushLog, resetDocker, statsStart as dockerStatsStart, streamStop as dockerStreamStop, emitEvent as dockerEmitEvent } from "./mockDocker"; // §15.3.D docker
 import { g1GitDirList, g1GitRun, g1Patch, g1Snapshot, gitCalls as g1GitCalls, setGitMissing as g1SetGitMissing } from "./mockGit";
 // G2's handler answers only while `gitFake.active`; G1's (tests/ui/mockGit.ts) is the Source Control fake.
 const gitHandlers: GitHandler[] = [gitHandlerG2, (req) => g1GitRun(req.repo, req.args, req.stdin ?? undefined)];
@@ -949,6 +949,7 @@ window.__harness = {
   dockerFakeSet: (patch: Record<string, unknown>) => Object.assign(dockerFake, patch),
   dockerLogStreams: () => dockerFake.logStreams.map((s) => ({ ...s })),
   dockerStreams: () => ({ stats: dockerFake.statsRunning, events: dockerFake.eventsRunning }),
+  dockerEmitEvent: (type: string, action: string, name: string, id: string) => dockerEmitEvent(type, action, name, id),
   dockerPushLog: (target: string, text: string) => dockerPushLog(target, text),
   dockerReset: () => resetDocker(),
   dockerState: () => dockerFake.containers.map((c) => ({ name: c.name, state: c.state })),

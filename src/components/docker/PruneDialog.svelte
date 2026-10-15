@@ -30,10 +30,11 @@
       untrack(() => {
         result = null;
         running = false;
-        void dockerStore.refresh(undefined, ["df"]);
       });
     }
     wasOpen = open;
+    // Sizes come from `system df`, which runs only while a view needs it.
+    if (open) return untrack(() => dockerStore.useDf());
   });
 
   async function go(): Promise<void> {

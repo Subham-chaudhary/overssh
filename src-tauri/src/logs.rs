@@ -125,7 +125,15 @@ pub fn build_command(src: &LogSource) -> Result<String, AppError> {
             if c.is_empty() {
                 return Err(AppError::config("empty command"));
             }
-            Ok(c.to_string())
+            // Own process group (setsid), so the stream watchdog can stop every
+            // process of a compound command (`a; b`, pipelines), not just the shell.
+            let inner = shell_quote(&format!("sh -c {}", shell_quote(c)));
+            Ok(format!(
+                "sh -c {}",
+                shell_quote(&format!(
+                    "if command -v setsid >/dev/null 2>&1; then exec setsid {inner}; else exec {inner}; fi"
+                ))
+            ))
         }
         other => Err(AppError::config(format!("unknown log source kind: {other}"))),
     }
@@ -235,7 +243,12 @@ pub async fn logs_open(
     source: LogSource,
 ) -> Result<String, AppError> {
     let session = sessions.get(&session_id).await?;
-    let base = build_command(&source)?;
+    // The watchdog kills the command when the channel's stdin ends (stream closed, or
+    // the connection dropped). Without it `docker logs -f` on a quiet container, or
+    // `tail -F` on a quiet file, never writes again to notice and lives on the VM
+    // forever. Under sudo it runs inside the root shell so it may kill the command;
+    // sudo reads the password line first and leaves the rest of stdin to it.
+    let base = crate::docker::stream_wrap(&build_command(&source)?);
     let sudo = source.sudo.unwrap_or(false);
     let cmd = if sudo { sudo_wrap(&base) } else { base };
 
@@ -474,6 +487,16 @@ mod tests {
         assert!(build_command(&src("file")).is_err());
         assert!(build_command(&src("command")).is_err());
         assert!(build_command(&src("bogus")).is_err());
+    }
+
+    #[test]
+    fn custom_command_gets_its_own_process_group() {
+        let mut c = src("command");
+        c.command = Some("tail -F /a; echo 'done'".into());
+        let cmd = build_command(&c).unwrap();
+        assert!(cmd.starts_with("sh -c "));
+        assert!(cmd.contains("exec setsid"));
+        assert!(cmd.contains("tail -F /a; echo"));
     }
 
     #[test]

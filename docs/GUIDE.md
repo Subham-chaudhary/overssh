@@ -1061,3 +1061,56 @@ Publish the draft release when all four builds are attached.
   window that was hidden to the tray.
 - Local OS paths go through `std::path` in Rust. Code that is only for one OS uses
   `#[cfg(windows)]`, `#[cfg(unix)]` or `#[cfg(target_os = "macos")]` (see `recording.rs` and `transfer.rs`).
+
+## 17. Load on the VM (Docker dashboard)
+
+Measured on `chalkdoor-stage-test` (Azure D2s_v3: 2 vCPU, 12 running containers, Docker 29.7, cgroup v2).
+The values are system CPU over 60 s:
+
+| State | System CPU |
+| --- | --- |
+| Idle | 4.5% |
+| Docker view open, before this fix | 16.2% (dockerd 4.7%, containerd 6.6%) |
+| Docker view open, after this fix | 4.8% |
+
+### 17.1 Causes
+
+1. **Healthcheck events caused refreshes.** Each healthcheck sends `exec_create`, `exec_start` and
+   `exec_die`. Two healthchecks gave 24 `exec_die` events in each minute. Each `exec_die` started a list
+   refresh: `docker ps -a` and then `docker compose ls -a`. Each of these opened a new SSH channel and
+   started a docker CLI. This happened about every 2.5 s, without end.
+2. **`docker ps --format '{{json .}}'` calculates sizes.** The CLI calculates the size of the writable layer
+   of each container when the template refers to `.Size` (docker/for-linux#1179). `{{json .}}` refers to all
+   fields. On the test VM, the call took 255 ms instead of 101 ms. The disk walk gets longer as the
+   containers write more files.
+3. **The streams did not stop.** After the Docker view was opened once, the events stream and the
+   refreshes that it caused continued until the app closed. They continued also when the view was
+   closed, the window was minimized, or the window was hidden in the tray.
+4. **`system df` was part of each full reload.** It walks all layers and volumes (moby#31951). On the test
+   VM it took 770 ms. On large hosts it can take minutes.
+5. **Log streams became orphans.** `docker logs -f` (and `tail -F`) on a quiet source never writes again.
+   Thus the process does not see that its channel closed. The test VM had two orphaned
+   `docker logs -f` processes from earlier sessions, 6 and 7 days old (parent = init).
+
+### 17.2 Rules
+
+- **Exec events:** `eventKind` ignores all `exec_*` events. `health_status` causes a refresh, because Docker
+  sends it only when the health changes.
+- **Refresh throttle:** the first refresh from an event waits 350 ms, to batch a burst. The next refreshes
+  wait for `refreshGap`: 2 s, or 3 × the duration of the last refresh, to a maximum of 30 s. Events that
+  arrive during the wait join the pending refresh.
+- **`ps` format:** `docker ps` uses `PS_FORMAT`, an explicit list of fields without `.Size`. If the CLI does not
+  accept the template (an old docker, or podman), the app uses `--size=false --format '{{json .}}'`.
+- **`compose ls`:** this command runs only when the set of compose projects in `ps` changes, or on a full
+  reload.
+- **`system df`:** this command runs only while a view that shows it is open: the System page, or the
+  prune dialog (`useDf()`).
+- **Streams:** the events and stats streams run only while a Docker view is mounted (`use()`) and the window
+  is visible (`live`). They stop 30 s after this stops being true (`IDLE_GRACE_MS`). When the streams start
+  again, the app reloads the lists. The 10 s fallback poll obeys the same rule. The auto-refresh of
+  `docker top` (3 s) skips ticks while the window is hidden.
+- **Stream watchdog:** each streaming exec (docker logs, stats and events, and all Logs-view sources) goes
+  through `docker::stream_wrap`. When the stdin of the channel closes, the watchdog kills the command.
+  Custom log commands run under `setsid`, so that the watchdog stops the whole process group. Under sudo,
+  the watchdog runs inside the root shell.
+- Do not add a timer that runs a docker command unless the view that shows the result is open.

@@ -24,10 +24,11 @@
   import CircleHelpIcon from "@lucide/svelte/icons/circle-help";
 
   onMount(() => {
-    dockerStore.activated = true;
+    const release = dockerStore.use();
     dockerStore.statsWanted++;
     return () => {
       dockerStore.statsWanted--;
+      release();
     };
   });
 

@@ -281,6 +281,9 @@ test("parseEventLine and eventKind", () => {
   const x = parseEventLine('{"Type":"container","Action":"exec_start: sh","Actor":{"ID":"a","Attributes":{}}}');
   assert.equal(x?.action, "exec_start");
   assert.equal(eventKind(x!), null);
+  // Healthchecks send exec_die every few seconds; it must not refresh the lists.
+  assert.equal(eventKind(parseEventLine('{"Type":"container","Action":"exec_die","Actor":{"ID":"a","Attributes":{}}}')!), null);
+  assert.equal(eventKind(parseEventLine('{"Type":"container","Action":"health_status: unhealthy","Actor":{"ID":"a","Attributes":{}}}')!), "containers");
   assert.equal(eventKind(parseEventLine('{"Type":"image","Action":"pull","Actor":{"ID":"i"}}')!), "images");
   assert.equal(eventKind(parseEventLine('{"Type":"volume","Action":"create","Actor":{"ID":"v"}}')!), "volumes");
   assert.equal(eventKind(parseEventLine('{"Type":"daemon","Action":"reload","Actor":{"ID":"v"}}')!), null);

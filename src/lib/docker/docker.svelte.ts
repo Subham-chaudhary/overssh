@@ -2,6 +2,12 @@
 // `api.dockerRun` and the three event streams (logs / stats / events); parsing is in ./parse.
 // Nothing runs until `dockerStore.activated` (set when the Docker view mounts or a Docker
 // palette command runs).
+//
+// Load on the VM (docs/GUIDE.md §17): the event and stats streams run only while a Docker view
+// is open and the window is visible (`live`); event-driven refreshes are throttled to the
+// refresh's own cost; healthcheck `exec_*` events are ignored; `docker ps` never asks for
+// sizes; `compose ls` runs only when the set of projects changes; `system df` runs only while
+// a view that shows it is open.
 
 import { untrack } from "svelte";
 import { toast } from "svelte-sonner";
@@ -243,6 +249,23 @@ class DockerStore {
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   private inited = false;
   private lastStatPush: Record<string, number> = {};
+  /** Docker views mounted now (`use()`), and views showing `system df` (`useDf()`). */
+  private users = 0;
+  private dfUsers = 0;
+  /** Streams run only while a Docker view is open and the window is visible. Turns off
+   * IDLE_GRACE_MS after that stops being true, so a quick switch does not restart them. */
+  live = $state(false);
+  private visible = typeof document === "undefined" || !document.hidden;
+  private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Sessions whose streams were stopped while idle: reload their lists on resume. */
+  private paused: Record<string, boolean> = {};
+  /** Duration and end time of the last list refresh per session (refresh throttle). */
+  private lastRefreshMs: Record<string, number> = {};
+  private lastRefreshEnd: Record<string, number> = {};
+  /** Compose project names seen in the last `docker ps`; `compose ls` reruns when they change. */
+  private composeKey: Record<string, string> = {};
+  /** The CLI rejected PS_FORMAT (an old docker or podman): use `{{json .}}` with `--size=false`. */
+  private psLegacy: Record<string, boolean> = {};
   /** List refresh in flight per session, and the kinds asked for meanwhile (null = all). */
   private refreshing: Record<string, Promise<void>> = {};
   private refreshQueued: Record<string, Set<EventKind | "df"> | null> = {};
@@ -284,6 +307,11 @@ class DockerStore {
       api.onDockerEventsEnd((p) => this.onStreamEnd("events", p.streamId)),
       api.onDockerStatsEnd((p) => this.onStreamEnd("stats", p.streamId)),
     ];
+    const onVisibility = () => {
+      this.visible = !document.hidden;
+      this.updateLive();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     const stopRoot = $effect.root(() => {
       $effect(() => {
         const sid = app.activeSessionId;
@@ -297,12 +325,23 @@ class DockerStore {
         const sid = app.activeSessionId;
         const ready = sid ? this.data[sid]?.phase === "ready" : false;
         const want = this.statsWanted > 0;
+        const live = this.live;
         untrack(() => {
           // Only the active session streams; others are stopped.
           for (const other of Object.keys(this.streams)) {
             if (other !== sid) this.stopStreams(other);
           }
           if (!sid || !ready) return;
+          if (!live) {
+            // No Docker view open, or the window is hidden: nothing runs on the VM.
+            if (this.streams[sid]) this.paused[sid] = true;
+            this.stopStreams(sid);
+            return;
+          }
+          if (this.paused[sid]) {
+            delete this.paused[sid];
+            void this.refresh(sid); // events were missed while paused
+          }
           void this.startEvents(sid);
           if (want) void this.startStats(sid);
           else this.stopStats(sid);
@@ -330,14 +369,16 @@ class DockerStore {
     });
     this.pollTimer = setInterval(() => {
       const sid = this.sessionId;
-      if (!sid || !this.activated || this.data[sid]?.phase !== "ready" || document.hidden) return;
+      if (!sid || !this.live || this.data[sid]?.phase !== "ready") return;
       if (!this.streams[sid]?.events) void this.refresh(sid, ["containers"]);
     }, 10_000);
     app.onSessionDrop((old) => this.forget(old));
     return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
       stopRoot();
       stopSaves();
       clearInterval(this.pollTimer);
+      clearTimeout(this.idleTimer);
       this.inited = false;
       for (const p of offs) void p.then((f) => f());
     };
@@ -360,7 +401,7 @@ class DockerStore {
         const fk = `${sid}|${kind}`;
         const n = (this.streamFailures[fk] = (this.streamFailures[fk] ?? 0) + 1);
         setTimeout(() => {
-          if (this.sessionId === sid && this.data[sid]?.phase === "ready" && app.sessions.some((x) => x.id === sid)) {
+          if (this.live && this.sessionId === sid && this.data[sid]?.phase === "ready" && app.sessions.some((x) => x.id === sid)) {
             if (kind === "events") void this.startEvents(sid);
             else if (this.statsWanted > 0) void this.startStats(sid);
           }
@@ -375,7 +416,7 @@ class DockerStore {
     try {
       const id = await api.dockerEventsStart(sid, this.cli);
       // Switched session (or Docker went away) while starting: do not leave it running unseen.
-      if (this.sessionId !== sid || this.data[sid]?.phase !== "ready") {
+      if (!this.live || this.sessionId !== sid || this.data[sid]?.phase !== "ready") {
         void api.dockerEventsStop(id).catch(() => {});
         return;
       }
@@ -400,7 +441,7 @@ class DockerStore {
     (this.starting[sid] ??= {}).stats = true;
     try {
       const id = await api.dockerStatsStart(sid, undefined, this.cli);
-      if (this.sessionId !== sid || this.data[sid]?.phase !== "ready" || this.statsWanted <= 0) {
+      if (!this.live || this.sessionId !== sid || this.data[sid]?.phase !== "ready" || this.statsWanted <= 0) {
         void api.dockerStatsStop(id).catch(() => {});
         return;
       }
@@ -455,10 +496,15 @@ class DockerStore {
     delete this.streams[sid];
   }
 
+  /** Event-driven refreshes: the first waits 350 ms to batch a burst (compose up sends dozens),
+   * later ones wait until `refreshGap` after the previous refresh ended. Events arriving
+   * meanwhile join the pending run instead of each starting one. */
   private markDirty(sid: string, kind: EventKind | "all"): void {
     (this.dirty[sid] ??= new Set()).add(kind);
-    clearTimeout(this.dirtyTimer);
+    if (this.dirtyTimer !== undefined) return;
+    const wait = Math.max(350, (this.lastRefreshEnd[sid] ?? 0) + this.refreshGap(sid) - Date.now());
     this.dirtyTimer = setTimeout(() => {
+      this.dirtyTimer = undefined;
       for (const [id, set] of Object.entries(this.dirty)) {
         delete this.dirty[id];
         if (this.data[id]?.phase !== "ready") continue;
@@ -478,7 +524,11 @@ class DockerStore {
 
   /** Runs and returns stdout, or null (and fills `listError`) on failure. */
   private async text(sid: string, args: string[]): Promise<string | null> {
-    const out = await this.run(args, { sid });
+    return this.checked(sid, args, await this.run(args, { sid }));
+  }
+
+  /** stdout of a finished list command, or null (and fills `listError`) on failure. */
+  private checked(sid: string, args: string[], out: DockerOutput): string | null {
     if (out.code !== 0) {
       const d = this.data[sid];
       if (d) {
@@ -560,7 +610,10 @@ class DockerStore {
     const p = (async () => {
       let next: Array<EventKind | "df"> | undefined = kinds;
       for (;;) {
+        const t0 = Date.now();
         await this.doRefresh(sid, next);
+        this.lastRefreshEnd[sid] = Date.now();
+        this.lastRefreshMs[sid] = this.lastRefreshEnd[sid] - t0;
         if (!(sid in this.refreshQueued)) break;
         const q = this.refreshQueued[sid];
         delete this.refreshQueued[sid];
@@ -569,6 +622,58 @@ class DockerStore {
     })().finally(() => delete this.refreshing[sid]);
     this.refreshing[sid] = p;
     return p;
+  }
+
+  /** Minimum time between event-driven refreshes: 2 s, or 3x the last refresh on a slow host
+   * (at most 30 s), so the dashboard never keeps a busy VM busy. */
+  private refreshGap(sid: string): number {
+    return Math.min(30_000, Math.max(2_000, 3 * (this.lastRefreshMs[sid] ?? 0)));
+  }
+
+  /** `docker ps -a` output (one JSON object per line), or null on failure. */
+  private async listContainers(sid: string): Promise<string | null> {
+    const legacy = !!this.psLegacy[sid];
+    const args = ["ps", "-a", "--no-trunc", ...(legacy ? ["--size=false", "--format", "{{json .}}"] : ["--format", PS_FORMAT])];
+    const out = await this.run(args, { sid });
+    if (!legacy && out.code !== 0 && /template|can't evaluate|not defined/i.test(out.stderr)) {
+      this.psLegacy[sid] = true;
+      return this.listContainers(sid);
+    }
+    return this.checked(sid, args, out);
+  }
+
+  /** A Docker view mounted; call the returned function on unmount. */
+  use(): () => void {
+    this.users++;
+    this.activated = true;
+    this.updateLive();
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.users--;
+      this.updateLive();
+    };
+  }
+
+  /** A view showing `system df` mounted (system page, prune dialog). Loads it now. */
+  useDf(): () => void {
+    this.dfUsers++;
+    void this.refresh(this.sessionId, ["df"]);
+    return () => {
+      this.dfUsers--;
+    };
+  }
+
+  private updateLive(): void {
+    clearTimeout(this.idleTimer);
+    if (this.users > 0 && this.visible) {
+      this.live = true;
+      return;
+    }
+    this.idleTimer = setTimeout(() => {
+      if (!(this.users > 0 && this.visible)) this.live = false;
+    }, IDLE_GRACE_MS);
   }
 
   private async doRefresh(sid: string, kinds?: Array<EventKind | "df">): Promise<void> {
@@ -582,17 +687,26 @@ class DockerStore {
       if (want("containers")) {
         jobs.push(
           (async () => {
-            const t = await this.text(sid, ["ps", "-a", "--no-trunc", "--format", "{{json .}}"]);
-            if (t !== null) d.containers = parseContainers(t);
-            const ls = await this.run(["compose", "ls", "-a", "--format", "json"], { sid });
-            d.composeLs = ls.code === 0 ? parseComposeLs(ls.stdout) : [];
+            const t = await this.listContainers(sid);
+            if (t === null) return;
+            d.containers = parseContainers(t);
+            // `compose ls` starts a second CLI and only adds config file paths: rerun it when
+            // the set of projects changes, or on a full reload.
+            const key = [...new Set(d.containers.map((c) => c.project ?? ""))].sort().join("\n");
+            if (!kinds || key !== this.composeKey[sid]) {
+              const ls = await this.run(["compose", "ls", "-a", "--format", "json"], { sid });
+              d.composeLs = ls.code === 0 ? parseComposeLs(ls.stdout) : [];
+              this.composeKey[sid] = key;
+            }
           })(),
         );
       }
       if (want("images")) jobs.push(this.text(sid, ["images", "--format", "{{json .}}"]).then((t) => void (t !== null && (d.images = parseImages(t)))));
       if (want("volumes")) jobs.push(this.text(sid, ["volume", "ls", "--format", "{{json .}}"]).then((t) => void (t !== null && (d.volumes = parseVolumes(t)))));
       if (want("networks")) jobs.push(this.text(sid, ["network", "ls", "--no-trunc", "--format", "{{json .}}"]).then((t) => void (t !== null && (d.networks = parseNetworks(t)))));
-      if (!kinds || kinds.includes("df")) {
+      // `system df` walks every image layer, container and volume (moby#31951): only while a
+      // view that shows it is open.
+      if ((!kinds || kinds.includes("df")) && this.dfUsers > 0) {
         jobs.push(this.text(sid, ["system", "df", "--format", "{{json .}}"]).then((t) => void (t !== null && (d.df = parseDf(t)))));
       }
       await Promise.all(jobs);
@@ -879,6 +993,17 @@ class DockerStore {
 }
 
 const EMPTY: SessionDocker = empty();
+
+/** Streams keep running this long after the last Docker view closes or the window hides. */
+const IDLE_GRACE_MS = 30_000;
+
+/** The `docker ps` fields the UI reads. Not `{{json .}}`: a template that mentions `.Size` makes
+ * the CLI compute every container's writable-layer size, a disk walk per container on each call
+ * (docker/for-linux#1179). */
+const PS_FORMAT =
+  '{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"Command":{{json .Command}},' +
+  '"State":{{json .State}},"Status":{{json .Status}},"Ports":{{json .Ports}},"Labels":{{json .Labels}},' +
+  '"Networks":{{json .Networks}},"Mounts":{{json .Mounts}},"CreatedAt":{{json .CreatedAt}},"RunningFor":{{json .RunningFor}}}';
 
 export const dockerStore = new DockerStore();
 
