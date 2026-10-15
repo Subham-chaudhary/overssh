@@ -5,7 +5,7 @@
   // detached Terminals window: buttons and a fixed title, no menu bar.
   import { onMount } from "svelte";
   import { app } from "../../lib/stores.svelte";
-  import { winClose, winSetTitle } from "../../lib/api";
+  import { confirmClose, winClose, winSetTitle } from "../../lib/api";
   import { basename } from "../../lib/paths";
   import WindowControls from "./WindowControls.svelte";
   import MenuBar from "./MenuBar.svelte";
@@ -37,8 +37,13 @@
   /** Main window close / File > Exit: asks first when files have unsaved changes.
    * (The compact terminal window docks back instead and has nothing to lose.) */
   async function requestClose(): Promise<void> {
-    if (!compact && !(await app.confirmQuit())) return;
-    winClose().catch(() => {});
+    if (compact) {
+      winClose().catch(() => {});
+      return;
+    }
+    // Already asked: tell the backend's close guard not to ask again (closeguard.rs).
+    if (!(await app.confirmQuit())) return;
+    confirmClose().catch(() => {});
   }
 
   const actions = {

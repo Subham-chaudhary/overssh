@@ -315,6 +315,31 @@ export function onTermExit(handler: (payload: TermExitEvent) => void): Promise<U
   return listen<TermExitEvent>("term://exit", (e) => handler(e.payload));
 }
 
+// --- closing the app (src-tauri/src/closeguard.rs) ---------------------------------
+
+/** Alt+F4 / taskbar close / tray Quit: the backend asks before closing (unsaved files). */
+export function onCloseRequested(handler: (quit: boolean) => void): Promise<UnlistenFn[]> {
+  return Promise.all([
+    listen("app://close-requested", () => handler(false)),
+    listen("app://quit-requested", () => handler(true)),
+  ]);
+}
+
+/** Closes the main window without asking again. */
+export function confirmClose(): Promise<void> {
+  return call<void>("confirm_close");
+}
+
+/** Quits the app (a confirmed tray Quit). */
+export function appQuit(): Promise<void> {
+  return call<void>("app_quit");
+}
+
+/** A tray Quit was cancelled. */
+export function quitCancelled(): Promise<void> {
+  return call<void>("quit_cancelled");
+}
+
 export function onSessionClosed(
   handler: (payload: SessionClosedEvent) => void,
 ): Promise<UnlistenFn> {

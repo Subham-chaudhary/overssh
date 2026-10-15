@@ -70,7 +70,7 @@ fn handle_menu(app: &AppHandle, event: MenuEvent) {
     let id = event.id().as_ref().to_string();
     match id.as_str() {
         "show" => show_main(app),
-        "quit" => app.exit(0),
+        "quit" => crate::closeguard::request_quit(app),
         "stop_all" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {

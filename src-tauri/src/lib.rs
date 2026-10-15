@@ -1,4 +1,5 @@
 mod appicon;
+mod closeguard;
 mod commands;
 mod cron;
 mod diskusage;
@@ -59,6 +60,7 @@ pub fn run() {
                 appicon::on_window_destroyed(window);
             }
             // Keep running tunnels alive: hide to the tray instead of quitting.
+            // A real close asks the frontend about unsaved files first (closeguard.rs).
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     use tauri::Manager;
@@ -66,7 +68,10 @@ pub fn run() {
                     let has_tray = window.app_handle().tray_by_id("main").is_some();
                     if has_tray && window.app_handle().state::<forward::ForwardManager>().should_hide_on_close() {
                         api.prevent_close();
+                        closeguard::clear_confirmation();
                         let _ = window.hide();
+                    } else if !closeguard::allow_close(window) {
+                        api.prevent_close();
                     }
                 }
             }
@@ -149,6 +154,9 @@ pub fn run() {
             localfs::local_write_text,
             localfs::local_read_text,
             appicon::set_taskbar_icon,
+            closeguard::confirm_close,
+            closeguard::app_quit,
+            closeguard::quit_cancelled,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
