@@ -1,6 +1,6 @@
 [package]
 name = "overssh"
-version = "1.2.13"
+version = "1.3.2"
 description = "Edit and browse remote VMs over plain SSH/SFTP"
 edition = "2021"
 
