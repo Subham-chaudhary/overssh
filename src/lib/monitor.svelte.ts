@@ -7,6 +7,9 @@
 //   - View mounted     -> the selected session streams at `intervalMs`
 //                         (unless paused: then it falls back to the slow rate).
 //   - Nothing mounted  -> everything is stopped.
+//   - Per-process data (`procs`) only for the htop tab: it is ~10x the CPU and ~30x the bytes
+//     of the rest on the VM (docs/GUIDE.md §17.3). The sidebar and other tabs stream light.
+//   - Window hidden (minimized, in the tray) for HIDDEN_GRACE_MS -> everything is stopped.
 
 import { untrack } from "svelte";
 import * as api from "./api";
@@ -15,6 +18,7 @@ import { registerCommand } from "./commands.svelte";
 import type { MonitorSnapshot, ProcDetails } from "./types";
 
 export const SLOW_MS = 5000;
+const HIDDEN_GRACE_MS = 30_000;
 export const HISTORY_LEN = 120;
 export const INTERVALS = [500, 1000, 2000, 5000, 10000] as const;
 export type MonTab = "overview" | "htop" | "services" | "disk" | "cron";
@@ -41,6 +45,9 @@ class MonitorStore {
   private pickedId = $state<string | null>(null);
 
   private viewMounts = 0;
+  /** The window has been hidden for HIDDEN_GRACE_MS: nothing streams. */
+  private asleep = false;
+  private hiddenTimer: ReturnType<typeof setTimeout> | undefined;
   private sidebarMounts = 0;
   private started = new Map<string, string>();
   private listening = false;
@@ -128,19 +135,22 @@ class MonitorStore {
   }
 
   private doSync(): void {
-    const want = new Map<string, { ms: number; threads: boolean }>();
-    if (this.sidebarMounts > 0) for (const s of app.sessions) want.set(s.id, { ms: SLOW_MS, threads: false });
-    const sel = this.selectedId;
-    if (this.viewMounts > 0 && sel) {
-      want.set(sel, { ms: this.paused ? SLOW_MS : this.intervalMs, threads: this.showThreads });
+    const want = new Map<string, { ms: number; threads: boolean; procs: boolean }>();
+    if (!this.asleep) {
+      if (this.sidebarMounts > 0) for (const s of app.sessions) want.set(s.id, { ms: SLOW_MS, threads: false, procs: false });
+      const sel = this.selectedId;
+      if (this.viewMounts > 0 && sel) {
+        const procs = this.tab === "htop";
+        want.set(sel, { ms: this.paused ? SLOW_MS : this.intervalMs, threads: procs && this.showThreads, procs });
+      }
     }
 
-    for (const [id, { ms, threads }] of want) {
-      const key = `${ms}:${threads ? 1 : 0}`;
+    for (const [id, { ms, threads, procs }] of want) {
+      const key = `${ms}:${threads ? 1 : 0}:${procs ? 1 : 0}`;
       if (this.started.get(id) === key) continue;
       this.started.set(id, key);
       if (!this.failures.get(id)) delete this.errors[id];
-      api.monitorStart(id, ms, threads).catch((err) => {
+      api.monitorStart(id, ms, threads, procs).catch((err) => {
         if (this.started.get(id) !== key) return; // stopped or restarted meanwhile
         this.started.delete(id);
         this.errors[id] = err?.message ?? String(err);
@@ -192,6 +202,20 @@ class MonitorStore {
   private ensureListening(): void {
     if (this.listening) return;
     this.listening = true;
+    document.addEventListener("visibilitychange", () => {
+      clearTimeout(this.hiddenTimer);
+      if (!document.hidden) {
+        if (this.asleep) {
+          this.asleep = false;
+          this.sync();
+        }
+        return;
+      }
+      this.hiddenTimer = setTimeout(() => {
+        this.asleep = true;
+        this.sync();
+      }, HIDDEN_GRACE_MS);
+    });
     void api.onMonitorSnapshot(({ sessionId, snapshot }) => {
       // A late snapshot of a stream we already stopped (session closed, view left) is dropped.
       if (!this.started.has(sessionId)) return;

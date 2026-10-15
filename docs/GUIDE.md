@@ -1114,3 +1114,27 @@ The values are system CPU over 60 s:
   Custom log commands run under `setsid`, so that the watchdog stops the whole process group. Under sudo,
   the watchdog runs inside the root shell.
 - Do not add a timer that runs a docker command unless the view that shows the result is open.
+
+### 17.3 CPU/RAM dashboard
+
+The collector is one long-running `sh -s` script for each session, which is already efficient. Each tick
+of the script reads `/proc/[pid]/stat` and `statm` and runs `ps -eo` for all processes. This
+per-process part is most of the cost. Only the htop tab uses it. Values were measured on the test VM
+(177 processes), over 60 s:
+
+| Mode | CPU used by the script | Data sent over SSH |
+| --- | --- | --- |
+| Full, 2 s (before: all views) | 0.78 s | 1.9 MB |
+| Light, 2 s (Overview and other tabs) | 0.18 s | 149 KB |
+| Full, 5 s (before: sidebar, for each session) | 0.31 s | 798 KB |
+| Light, 5 s (sidebar) | 0.07 s | 63 KB |
+
+Rules:
+- `monitor_start` takes `procs`. When `procs` is false, the script does not collect the per-process
+  sections. The task count then comes from a shell glob (`set -- /proc/[0-9]*`, no new process) and from
+  `/proc/loadavg`. The store requests `procs` only for the htop tab. When the user changes the tab, the
+  stream restarts in the applicable mode.
+- When the window is hidden for 30 s, all monitor streams stop. When the window is visible again, they
+  start again.
+- Cost grows linearly with the number of processes and with 1/interval. The 500 ms interval collects
+  4 times as much data as the default 2 s.

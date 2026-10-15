@@ -17,7 +17,11 @@ export const scenario: Scenario = {
     await waitFor(async () => (await page.locator('[data-testid="spark-cpu"]').count()) === 1, "cpu sparkline");
     // processes moved to the htop tab (§14.4.H): the Overview has none
     assert((await page.locator('[data-testid="proc-row"]').count()) === 0, "overview has no process table");
+    // ...so the VM does not collect per-process data for it (the costly part, §17.3).
+    const running = () => page.evaluate(() => window.__harness.monitorRunning());
+    await waitFor(async () => (await running()).length > 0 && (await running()).every((r) => r.procs === false), "overview streams without process data");
     await page.locator('[data-testid="monitor-tab-htop"]').click();
+    await waitFor(async () => (await running()).some((r) => r.procs === true), "htop tab streams process data");
     await waitFor(async () => (await page.locator('[data-testid="proc-row"]').count()) === 6, "6 process rows");
 
     // default sort: CPU desc -> nginx first

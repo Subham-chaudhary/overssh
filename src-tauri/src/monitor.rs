@@ -8,6 +8,11 @@
 //! computes every percentage/rate from deltas against the previous block (the way
 //! htop/btop do), then emits `monitor://snapshot`.
 //!
+//! Per-process sections (`/proc/[pid]/stat`, `statm`, `ps`) are most of the cost:
+//! about 10x the CPU and 30x the bytes of the rest. They are collected only when
+//! `procs` is set (the htop tab). Otherwise the task count comes from a shell glob
+//! and `/proc/loadavg`, with no extra process (docs/GUIDE.md §17.3).
+//!
 //! Degrades gracefully: a missing source just yields an empty/zero section.
 //! Linux targets only. Disk I/O is not collected.
 
@@ -161,23 +166,28 @@ if [ $((n % 10)) -eq 0 ]; then
 echo "@@df"; df -Pkl 2>/dev/null || df -Pk 2>/dev/null
 fi
 n=$((n + 1))
+if [ __PROCS__ = 1 ]; then
 echo "@@proc"; cat /proc/[0-9]*/stat 2>/dev/null
 echo "@@statm"; grep -H . /proc/[0-9]*/statm 2>/dev/null
 if [ __THREADS__ = 1 ]; then
 echo "@@task"; grep -H . /proc/[0-9]*/task/[0-9]*/stat 2>/dev/null
 fi
 echo "@@ps"; ps -eo pid,user:32,args 2>/dev/null || ps -eo pid,user,args 2>/dev/null
+else
+set -- /proc/[0-9]*; echo "@@nproc"; echo $#
+fi
 echo "@@END"
 sleep $d 2>/dev/null || sleep 1
 d=__INTERVAL__
 done
 "#;
 
-fn build_script(interval_ms: u64, threads: bool) -> String {
+fn build_script(interval_ms: u64, threads: bool, procs: bool) -> String {
     let ms = interval_ms.clamp(250, 60_000);
     SCRIPT_TEMPLATE
         .replace("__INTERVAL__", &format!("{}.{:03}", ms / 1000, ms % 1000))
-        .replace("__THREADS__", if threads { "1" } else { "0" })
+        .replace("__THREADS__", if threads && procs { "1" } else { "0" })
+        .replace("__PROCS__", if procs { "1" } else { "0" })
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +512,7 @@ impl Collector {
         let page = if self.page > 0 { self.page } else { 4096 };
 
         let cpus = parse_stat(get("stat"));
-        let (load, _) = parse_loadavg(get("loadavg"));
+        let (load, load_tasks) = parse_loadavg(get("loadavg"));
         let mem = parse_meminfo(get("meminfo"));
         if sections.contains_key("df") {
             self.disks = parse_df(get("df"));
@@ -575,6 +585,14 @@ impl Collector {
             let args = if args.is_empty() { format!("[{}]", r.comm) } else { clip(args, 1024) };
             let shr = shm.get(&r.pid).map(|p| (*p as f64 * page_f) as u64).unwrap_or(0);
             procs.push(mk(r, r.pid, false, cpu_of(&self.prev_ticks, r), user, args, kernel, res, shr));
+        }
+        if !sections.contains_key("proc") {
+            // Light mode: process count from the shell glob, running/threads from loadavg.
+            tasks.total = get("nproc").trim().parse().unwrap_or(0);
+            if let Some((running, threads)) = load_tasks {
+                tasks.running = running;
+                tasks.threads = threads;
+            }
         }
         // Thread rows share the owner's memory numbers, user and command line.
         let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
@@ -686,6 +704,7 @@ async fn spawn_loop(
     session: Arc<Session>,
     interval_ms: u64,
     threads: bool,
+    procs: bool,
 ) -> Result<(), AppError> {
     let mut channel = session.open_channel().await?;
     channel
@@ -693,7 +712,7 @@ async fn spawn_loop(
         .await
         .map_err(|e| AppError::Io { message: e.to_string() })?;
     channel
-        .data_bytes(build_script(interval_ms, threads).into_bytes())
+        .data_bytes(build_script(interval_ms, threads, procs).into_bytes())
         .await
         .map_err(|e| AppError::Io { message: e.to_string() })?;
     let _ = channel.eof().await;
@@ -761,10 +780,12 @@ pub async fn monitor_start(
     session_id: String,
     interval_ms: u64,
     threads: Option<bool>,
+    procs: Option<bool>,
 ) -> Result<(), AppError> {
     let session = sessions.get(&session_id).await?;
     monitors.stop(&session_id).await;
-    spawn_loop(app, monitors.inner().clone(), session, interval_ms, threads.unwrap_or(false)).await
+    let procs = procs.unwrap_or(true);
+    spawn_loop(app, monitors.inner().clone(), session, interval_ms, threads.unwrap_or(false), procs).await
 }
 
 #[tauri::command]
@@ -1030,6 +1051,38 @@ pub async fn proc_details(
 }
 
 #[cfg(test)]
+mod light_mode_tests {
+    use super::*;
+
+    #[test]
+    fn light_script_skips_per_process_sections() {
+        let s = build_script(5000, true, false);
+        assert!(s.contains("if [ 0 = 1 ]; then\necho \"@@proc\""));
+        assert!(s.contains("@@nproc"));
+        assert!(!s.contains("[ 1 = 1 ]"), "threads need procs");
+    }
+
+    #[test]
+    fn light_mode_counts_tasks_from_glob_and_loadavg() {
+        let mut c = Collector::default();
+        let block = |cpu: u64| {
+            let mut m = HashMap::new();
+            m.insert("stat".to_string(), format!("cpu  {cpu} 0 10 100 0 0 0 0\ncpu0 {cpu} 0 10 100 0 0 0 0\n"));
+            m.insert("loadavg".to_string(), "0.10 0.20 0.30 3/412 999\n".to_string());
+            m.insert("nproc".to_string(), "177\n".to_string());
+            m
+        };
+        let t0 = Instant::now();
+        assert!(c.ingest(&block(10), t0, 1_000).is_none()); // first block only primes deltas
+        let snap = c.ingest(&block(20), t0 + std::time::Duration::from_secs(2), 3_000).unwrap();
+        assert_eq!(snap.tasks.total, 177);
+        assert_eq!(snap.tasks.running, 3);
+        assert_eq!(snap.tasks.threads, 412);
+        assert!(snap.procs.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1222,8 +1275,8 @@ mod tests {
 
     #[test]
     fn script_threads_flag() {
-        assert!(build_script(1000, true).contains("[ 1 = 1 ]"));
-        assert!(build_script(1000, false).contains("[ 0 = 1 ]"));
+        assert!(build_script(1000, true, true).contains("[ 1 = 1 ]"));
+        assert!(build_script(1000, false, true).contains("[ 0 = 1 ]"));
         assert_eq!(clip("héllo".to_string(), 2), "h…");
     }
 
@@ -1236,7 +1289,7 @@ mod tests {
 
     #[test]
     fn script_interval() {
-        assert!(build_script(1500, false).contains("d=1.500"));
-        assert!(build_script(10, true).contains("d=0.250"));
+        assert!(build_script(1500, false, true).contains("d=1.500"));
+        assert!(build_script(10, true, true).contains("d=0.250"));
     }
 }

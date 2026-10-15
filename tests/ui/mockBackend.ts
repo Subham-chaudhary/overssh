@@ -218,7 +218,7 @@ const duDepth = (p: string) => (p === "/" ? 0 : p.split("/").length - 1);
 
 // --- fake dashboard (monitor.rs) ---------------------------------------------
 
-const monitorTimers = new Map<string, { timer: ReturnType<typeof setInterval>; intervalMs: number; threads: boolean }>();
+const monitorTimers = new Map<string, { timer: ReturnType<typeof setInterval>; intervalMs: number; threads: boolean; procs: boolean }>();
 const killLog: { pid: number; signal: string }[] = [];
 const reniceLog: { pid: number; nice: number }[] = [];
 const detailLog: number[] = [];
@@ -618,9 +618,12 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
       const ms = Math.max(50, Math.min(Number(args.intervalMs) || 1000, 400));
       clearInterval(monitorTimers.get(sid)?.timer);
       const threads = args.threads === true;
-      const timer = setInterval(() => void emit("monitor://snapshot", { sessionId: sid, snapshot: fakeSnapshot(threads) }), ms);
-      monitorTimers.set(sid, { timer, intervalMs: Number(args.intervalMs), threads });
-      void emit("monitor://snapshot", { sessionId: sid, snapshot: fakeSnapshot(threads) });
+      // Light mode (sidebar, non-htop tabs): no per-process rows, like the real collector.
+      const procs = args.procs !== false;
+      const snap = () => (procs ? fakeSnapshot(threads) : { ...fakeSnapshot(false), procs: [] });
+      const timer = setInterval(() => void emit("monitor://snapshot", { sessionId: sid, snapshot: snap() }), ms);
+      monitorTimers.set(sid, { timer, intervalMs: Number(args.intervalMs), threads, procs });
+      void emit("monitor://snapshot", { sessionId: sid, snapshot: snap() });
       return null;
     }
 
@@ -854,7 +857,7 @@ declare global {
        * `session://closed` fires with an error reason (not a user disconnect). */
       dropSession: (sessionId: string, reason?: string) => Promise<void>;
       /** Dashboard (§13.4.M / §14.4.H) test surface. */
-      monitorRunning: () => { sessionId: string; intervalMs: number; threads: boolean }[];
+      monitorRunning: () => { sessionId: string; intervalMs: number; threads: boolean; procs: boolean }[];
       kills: () => { pid: number; signal: string }[];
       reniceCalls: () => { pid: number; nice: number }[];
       detailCalls: () => number[];
@@ -926,7 +929,7 @@ window.__harness = {
   setTransferStepMs: (ms) => {
     transferStepMs = ms;
   },
-  monitorRunning: () => [...monitorTimers].map(([sessionId, v]) => ({ sessionId, intervalMs: v.intervalMs, threads: v.threads })),
+  monitorRunning: () => [...monitorTimers].map(([sessionId, v]) => ({ sessionId, intervalMs: v.intervalMs, threads: v.threads, procs: v.procs })),
   kills: () => [...killLog],
   reniceCalls: () => [...reniceLog],
   detailCalls: () => [...detailLog],

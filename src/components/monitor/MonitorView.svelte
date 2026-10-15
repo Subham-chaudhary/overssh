@@ -33,9 +33,10 @@
 
   $effect(() => monitor.attachView());
   $effect(() => {
-    // re-sync when the selection / session list changes
+    // re-sync when the selection / session list / tab changes (only htop streams per-process data)
     void monitor.selectedId;
     void app.sessions.length;
+    void monitor.tab;
     monitor.sync();
   });
 

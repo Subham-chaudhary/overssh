@@ -352,8 +352,9 @@ export function onLogEnd(handler: (payload: LogEndEvent) => void): Promise<Unlis
 
 // --- Dashboard (§13.4.M) ------------------------------------------------
 
-export function monitorStart(sessionId: string, intervalMs: number, threads = false): Promise<void> {
-  return call<void>("monitor_start", { sessionId, intervalMs, threads });
+/** `procs: false` skips the per-process sections (the costly part on the VM); the htop tab needs them. */
+export function monitorStart(sessionId: string, intervalMs: number, threads = false, procs = true): Promise<void> {
+  return call<void>("monitor_start", { sessionId, intervalMs, threads, procs });
 }
 
 export function procKillMany(sessionId: string, pids: number[], signal: string): Promise<void> {
