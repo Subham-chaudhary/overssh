@@ -14,6 +14,8 @@ import { THEMES } from './themes';
  *
  * No-op outside Tauri. Never throws.
  */
+const TASKBAR_SIZE = 64;
+
 export async function applyWindowIcon(themeId: ThemeId, accent: string | null = null): Promise<void> {
   // Silent no-op if not running in Tauri
   if (!('__TAURI_INTERNALS__' in window)) {
@@ -97,6 +99,18 @@ export async function applyWindowIcon(themeId: ThemeId, accent: string | null = 
     const tauriImg = await Image.new(rgba, iconSize, iconSize);
     const window_obj = getCurrentWindow();
     await window_obj.setIcon(tauriImg);
+
+    // `setIcon` only changes the small icon on Windows; the taskbar button uses the big one
+    // (src-tauri/src/appicon.rs). 64 px: Windows scales it to the taskbar size at any DPI.
+    const big = new OffscreenCanvas(TASKBAR_SIZE, TASKBAR_SIZE);
+    const bctx = big.getContext('2d');
+    if (bctx) {
+      bctx.imageSmoothingQuality = 'high';
+      bctx.drawImage(canvas, 0, 0, TASKBAR_SIZE, TASKBAR_SIZE);
+      const px = bctx.getImageData(0, 0, TASKBAR_SIZE, TASKBAR_SIZE).data;
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('set_taskbar_icon', { rgba: Array.from(px), width: TASKBAR_SIZE, height: TASKBAR_SIZE });
+    }
   } catch (error) {
     // Silently fail - icon change is non-critical
     console.warn('Failed to apply window icon:', error);

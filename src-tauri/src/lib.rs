@@ -1,3 +1,4 @@
+mod appicon;
 mod commands;
 mod cron;
 mod diskusage;
@@ -54,6 +55,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             terminal::on_window_event(window, event);
+            if let tauri::WindowEvent::Destroyed = event {
+                appicon::on_window_destroyed(window);
+            }
             // Keep running tunnels alive: hide to the tray instead of quitting.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -144,6 +148,7 @@ pub fn run() {
             systemd::systemd_action,
             localfs::local_write_text,
             localfs::local_read_text,
+            appicon::set_taskbar_icon,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
